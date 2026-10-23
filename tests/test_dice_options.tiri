@@ -1,0 +1,184 @@
+   import '../options', '../view'
+
+THEMES <const> = array<table> {
+   { name='white', red=250, green=245, blue=228, body='#d8d3c5', pips='#17191dc0', glow='#d690ff' },
+   { name='red',   red=230, green=65,  blue=65,  body='#b63232', pips='#fff8e8', glow='#ffd23c' }
+}
+
+function settings():table
+   return {
+      diceCount=1, sides=6, dice=array<table> {
+         { theme='white' }, { }, { }, { }, { }, { }
+      },
+      scale=1, maxScale=2, face='pips', font='sans-serif', shading=false, opacity=1
+   }
+end
+
+@Test function ControlsSurviveCollectionAndApplyEditedSettings()
+   local applied:table
+   local closed = 0
+   local state = dice_options.open(settings(), THEMES, function(Settings:table!)
+      applied = Settings
+   end, function() closed++ end)
+   defer state.window.surface?.free() end
+   local surface_id = state.window.surface.id
+
+   processing.collect()
+   processing.collect()
+   state.sizeSlider.setValue(1.25)
+   state.opacitySlider.setValue(0.5)
+   state.countSlider.setValue(3)
+   state.sidesCombo.events.activate({ label='D20', num=20 })
+   state.faceCombo.events.activate({ label='sans-serif', face='num' })
+
+   state.applyButton.events.activate()
+   state.applyButton.events.activate()
+   assert(applied != nil and closed is 1, 'Apply must report settings and close exactly once')
+   assert(applied.scale is 1.25 and applied.opacity is 0.5, 'Slider edits must survive collection')
+   assert(applied.diceCount is 3 and applied.sides is 20 and applied.face is 'num',
+      'Apply must pass the edited dice and face settings')
+   assert(processing.sleep(0) != ERR_Terminate, 'Applying options must keep the process running')
+   assert(obj.find(surface_id) is nil, 'Apply must release the options surface after its callback returns')
+end
+
+@Test function CancelKeepsTheProcessRunningAcrossRepeatedWindows()
+   local applied = 0
+   local closed = 0
+   for i in {0 to 3} do
+      local state = dice_options.open(settings(), THEMES, function() applied++ end, function() closed++ end)
+      defer state.window.surface?.free() end
+      local surface_id = state.window.surface.id
+      processing.collect()
+      state.cancelButton.events.activate()
+      assert(processing.sleep(0) != ERR_Terminate, 'Cancelling options must keep the process running')
+      assert(obj.find(surface_id) is nil, 'Cancel must release the options surface')
+   end
+   assert(applied is 0 and closed is 3, 'Cancel must close each window without applying settings')
+end
+
+@Test function InitialSettingsAreShown()
+   local initial = settings()
+   initial.diceCount = 4
+   initial.sides = 12
+   initial.face = 'num'
+   initial.font = 'Noto Sans'
+   initial.shading = true
+   local state = dice_options.open(initial, THEMES, function() end, function() end)
+   defer state.window.surface?.free() end
+
+   assert(state.countSlider.value is 4, 'The count slider must start at the dice count')
+   assert(state.sidesCombo.text.string is 'D12', 'The sides combobox must show the configured sides')
+   assert(state.faceCombo.text.string is 'Noto Sans', 'Numbered faces must show the font name')
+   assert(state.shadingToggle.value is 1, 'The shading toggle must reflect the setting')
+   assert(state.colourSlots[1].halo.visibility is VIS_VISIBLE and
+      state.colourSlots[0].halo.visibility is VIS_HIDDEN, 'Only unthemed slots show the random marker')
+   assert(state.colourSlots[4].button.viewport.opacity < 1, 'Slots beyond the dice count must be dimmed')
+end
+
+@Test function ChoosingFontSelectsNumberedFaces()
+   local applied:table
+   local state = dice_options.open(settings(), THEMES, function(Settings:table!)
+      applied = Settings
+   end, function() end)
+   defer state.window.surface?.free() end
+
+   assert(state.faceCombo.text.string is 'Pips', 'Pip faces must be shown initially')
+   state.setFont('DejaVu Serif')
+   assert(state.faceCombo.text.string is 'DejaVu Serif', 'Choosing a font must select it in the combobox')
+
+   -- The font name must also replace the numbered entry in the drop-down.
+
+   local labels = array<str>
+   for item in values(state.faceCombo.menu.items) do labels.push(item.config.label) end
+   assert('DejaVu Serif' in labels and not ('sans-serif' in labels), 'The drop-down must list the new font')
+
+   state.faceCombo.events.activate({ label='Pips', face='pips' })
+   state.shadingToggle.events.activate()
+   state.applyButton.events.activate()
+   assert(applied.font is 'DejaVu Serif' and applied.face is 'pips', 'Pips can be reselected after a font choice')
+end
+
+@Test function ColourButtonsRecolourInPlace()
+   local applied:table
+   local state = dice_options.open(settings(), THEMES, function(Settings:table!)
+      applied = Settings
+   end, function() end)
+   defer state.window.surface?.free() end
+
+   local slot = state.colourSlots[1]
+   local viewport_id = slot.button.viewport.id
+   assert(slot.button.text.string is '2', 'Each colour button must show its die number')
+   assert(slot.button.bkgd.fill is 'url(#colourSlot1)', 'The button background must use the slot gradient')
+
+   -- Activating the button opens the colour menu for that slot; choosing an item recolours the same button.
+
+   slot.button.events.activate()
+   assert(state.colourMenu.visible, 'Activating a colour button must open the colour menu')
+   state.colourMenu.onActivate({ label='Red', value='red' })
+   state.colourMenu.hide()
+   processing.sleep(0)
+
+   assert(slot.button.viewport.id is viewport_id, 'Changing a colour must not recreate the button')
+   assert(slot.button.bkgd.fill is 'url(#colourSlot1)', 'The button background must still use the slot gradient')
+   assert(slot.halo.visibility is VIS_HIDDEN, 'A themed slot must hide the random halo')
+   assert(slot.button.text.fill is '#fff8e8', 'The number must contrast with the red body')
+
+   state.applyButton.events.activate()
+   assert(applied.dice[1].theme is 'red', 'The chosen colour must be applied to the die')
+end
+
+@Test function PreviewFollowsEditedSettings()
+   local state = dice_options.open(settings(), THEMES, function() end, function() end)
+   defer state.window.surface?.free() end
+   local preview = state.preview
+
+   assert(preview.window and preview.view, 'Opening the options must show a preview die')
+   assert(preview.view.shape.sides is 6 and preview.view.theme.name is 'white', 'The preview must match die 1')
+   assert(preview.window.surface.width is dice_view.layout(1).size, 'The preview must be sized for the scale')
+
+   state.sidesCombo.events.activate({ label='D20', num=20 })
+   state.sizeSlider.setValue(1.5)
+   state.opacitySlider.setValue(0.5)
+   state.shadingToggle.value = 1
+   state.shadingToggle.events.activate()
+   state.faceCombo.events.activate({ label='sans-serif', face='num' })
+   state.colourSlots[1].button.events.activate()
+   state.colourMenu.hide()
+   processing.sleep(0.05)
+   local random_theme = preview.view.theme
+   assert(random_theme in THEMES, 'A random slot must preview one of the available colours')
+   processing.sleep(0.05)
+   assert(preview.view.theme is random_theme, 'A random slot must keep its preview colour between edits')
+
+   state.colourSlots[1].button.events.activate()
+   state.colourMenu.onActivate({ label='Red', value='red' })
+   state.colourMenu.hide()
+
+   local q = preview.q
+   processing.sleep(0.1)
+   assert(not preview.dirty, 'Edits must be applied on the next animation tick')
+   assert(preview.q != q, 'The preview die must spin')
+
+   local view = preview.view
+   assert(view.shape.sides is 20, 'The preview must use the chosen sides')
+   assert(view.theme.name is 'red', 'The preview must use the colour of the chosen slot')
+   assert(view.config.shading and view.config.face is 'num', 'The preview must use the shading and face options')
+   assert(view.translucent and view.config.opacity is 0.5, 'The preview must use the chosen opacity')
+   assert(preview.window.surface.width is dice_view.layout(1.5).size, 'The preview must resize with the scale')
+end
+
+@Test function PreviewClosesWithTheOptions()
+   for _, close in array<str> { 'apply', 'free' } do
+      local state = dice_options.open(settings(), THEMES, function() end, function() end)
+      defer state.window.surface?.free() end
+      local preview_id = state.preview.window.surface.id
+      if close is 'apply' then
+         state.applyButton.events.activate()
+      else
+         state.window.surface.free()
+      end
+      processing.sleep(0)
+      assert(obj.find(preview_id) is nil, f'Closing by {close} must free the preview window')
+      assert(state.preview.timer is nil, f'Closing by {close} must stop the preview animation')
+   end
+end

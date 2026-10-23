@@ -1,0 +1,218 @@
+-- Shared convex meshes.  Every shape fits inside the D6's existing sqrt(3) bounding sphere.
+-- Face areas and local label frames are derived once, before animation begins.
+
+   namespace dice_shapes { }
+
+function dot(A:table!, B:table!):num
+   return A.x * B.x + A.y * B.y + A.z * B.z
+end
+
+function sub(A:table!, B:table!):table
+   return { x=A.x - B.x, y=A.y - B.y, z=A.z - B.z }
+end
+
+function cross(A:table!, B:table!):table
+   return { x=A.y * B.z - A.z * B.y, y=A.z * B.x - A.x * B.z, z=A.x * B.y - A.y * B.x }
+end
+
+function scale(A:table!, S:num!):table
+   return { x=A.x * S, y=A.y * S, z=A.z * S }
+end
+
+function unit(A:table!):table
+   return scale(A, 1 / math.sqrt(dot(A, A)))
+end
+
+-- Enumerate supporting planes, merging coplanar triangles into a single polygon.
+-- These small meshes have at most twenty vertices; this runs only once per requested shape.
+
+function hull(Vertices:array<table>!):array<table>
+   local faces = array<table> { }
+   for a in {0 to #Vertices - 2} do
+      for b in {a + 1 to #Vertices - 1} do
+         for c in {b + 1 to #Vertices} do
+            local normal = cross(sub(Vertices[b], Vertices[a]), sub(Vertices[c], Vertices[a]))
+            if dot(normal, normal) < 0.00000001 then continue end
+            normal = unit(normal)
+            local distance = dot(normal, Vertices[a])
+            if distance < 0 then normal, distance = scale(normal, -1), -distance end
+            if distance < 0.000001 then continue end
+            local supporting = true
+            for _, vertex in Vertices do
+               if dot(normal, vertex) > distance + 0.000001 then supporting = false; break end
+            end
+            if not supporting then continue end
+            local duplicate = false
+            for _, face in faces do
+               if dot(face.normal, normal) > 0.999999 then duplicate = true; break end
+            end
+            if duplicate then continue end
+            local indices = array<int> { }
+            local centre = { x=0, y=0, z=0 }
+            for i, vertex in Vertices do
+               if math.abs(dot(normal, vertex) - distance) < 0.000001 then
+                  indices.push(i)
+                  centre.x += vertex.x
+                  centre.y += vertex.y
+                  centre.z += vertex.z
+               end
+            end
+            centre = scale(centre, 1 / #indices)
+            local u = unit(sub(Vertices[indices[0]], centre))
+            local v = cross(normal, u)
+            indices.sort(function(A:num!, B:num!):bool
+               local pa, pb = sub(Vertices[A], centre), sub(Vertices[B], centre)
+               return math.atan2(dot(pa, v), dot(pa, u)) < math.atan2(dot(pb, v), dot(pb, u))
+            end)
+            faces.push({ indices=indices, normal=normal, centre=centre, distance=distance })
+         end
+      end
+   end
+   return faces
+end
+
+function dual(Vertices:array<table>!):array<table>
+   local result = array<table> { }
+   for _, face in hull(Vertices) do result.push(scale(face.normal, 1 / face.distance)) end
+   return result
+end
+
+local cache = { }
+
+dice_shapes.get = function(Sides:num!):table
+   if cache[Sides] then return cache[Sides] end
+   if not (Sides in array<int> { 4, 6, 8, 10, 12, 20 }) then
+      raise 'Supported dice have 4, 6, 8, 10, 12 or 20 sides.'
+   end
+   local vertices = array<table> { }
+   if Sides is 4 or Sides is 6 then
+      for z in {-1 into 1 by 2} do
+         -- Preserve the original D6 vertex order and face numbering.
+         vertices.push({ x=-1, y=-1, z=z })
+         vertices.push({ x=1, y=-1, z=z })
+         vertices.push({ x=1, y=1, z=z })
+         vertices.push({ x=-1, y=1, z=z })
+      end
+      if Sides is 4 then
+         vertices = array<table> { vertices[0], vertices[2], vertices[5], vertices[7] }
+      end
+   elseif Sides is 8 then
+      vertices = array<table> {
+         { x=1, y=0, z=0 }, { x=-1, y=0, z=0 }, { x=0, y=1, z=0 },
+         { x=0, y=-1, z=0 }, { x=0, y=0, z=1 }, { x=0, y=0, z=-1 }
+      }
+   elseif Sides is 10 then
+      -- The polar dual of a regular pentagonal antiprism is a pentagonal trapezohedron.
+      local height = math.sqrt(math.sin(math.pi / 5) ** 2 - math.sin(math.pi / 10) ** 2)
+      for i in {0 to 10} do
+         local angle = i * math.pi / 5
+         vertices.push({ x=math.cos(angle), y=math.sin(angle), z=(i % 2 is 0) ? height : -height })
+      end
+      vertices = dual(vertices)
+   else
+      local phi = (1 + math.sqrt(5)) * 0.5
+      for a in {-1 into 1 by 2} do
+         for b in {-1 into 1 by 2} do
+            vertices.push({ x=0, y=a, z=b * phi })
+            vertices.push({ x=a, y=b * phi, z=0 })
+            vertices.push({ x=b * phi, y=0, z=a })
+         end
+      end
+      if Sides is 12 then vertices = dual(vertices) end
+   end
+   local radius = 0
+   for _, vertex in vertices do radius = math.max(radius, math.sqrt(dot(vertex, vertex))) end
+   for i, vertex in vertices do vertices[i] = scale(vertex, math.sqrt(3) / radius) end
+   local faces = hull(vertices)
+   if Sides is 6 then
+      faces = array<table> {
+         { value=6, indices=array<int> { 1, 0, 3, 2 }, normal={ x=0, y=0, z=-1 } },
+         { value=1, indices=array<int> { 4, 5, 6, 7 }, normal={ x=0, y=0, z=1 } },
+         { value=4, indices=array<int> { 0, 4, 7, 3 }, normal={ x=-1, y=0, z=0 } },
+         { value=3, indices=array<int> { 5, 1, 2, 6 }, normal={ x=1, y=0, z=0 } },
+         { value=5, indices=array<int> { 0, 1, 5, 4 }, normal={ x=0, y=-1, z=0 } },
+         { value=2, indices=array<int> { 7, 6, 2, 3 }, normal={ x=0, y=1, z=0 } }
+      }
+   end
+   if Sides != 4 and Sides != 6 then
+      local value = 1
+      for _, face in faces do
+         if face.value then continue end
+         face.value = value
+         for _, opposite in faces do
+            if dot(face.normal, opposite.normal) < -0.999999 then
+               opposite.value = Sides + 1 - value
+               break
+            end
+         end
+         value++
+      end
+   end
+   local edges = array<table> { }
+   local volume, radial_moment = 0, 0
+   for i, face in faces do
+      face.value ?= i + 1
+      local centre = { x=0, y=0, z=0 }
+      for _, index in face.indices do
+         local vertex = vertices[index]
+         centre.x += vertex.x
+         centre.y += vertex.y
+         centre.z += vertex.z
+      end
+      face.centre = scale(centre, 1 / #face.indices)
+      face.area = 0
+      local inset = math.huge
+      for j, a in face.indices do
+         local b = face.indices[(j + 1) % #face.indices]
+         local edge = sub(vertices[b], vertices[a])
+         face.area += dot(face.normal, cross(sub(vertices[a], face.centre), sub(vertices[b], face.centre))) * 0.5
+         inset = math.min(inset, math.sqrt(dot(cross(edge, sub(face.centre, vertices[a])),
+            cross(edge, sub(face.centre, vertices[a])))) / math.sqrt(dot(edge, edge)))
+         if a < b then edges.push({ a=a, b=b }) end
+      end
+      -- Integrate r^2 over tetrahedra from the origin to each face triangle.
+      local a = vertices[face.indices[0]]
+      for j in {1 to #face.indices - 1} do
+         local b, c = vertices[face.indices[j]], vertices[face.indices[j + 1]]
+         local tetra_volume = dot(a, cross(b, c)) / 6
+         volume += tetra_volume
+         radial_moment += tetra_volume * (dot(a, a) + dot(b, b) + dot(c, c) +
+            dot(a, b) + dot(a, c) + dot(b, c)) / 10
+      end
+      local u = unit(sub(vertices[face.indices[1]], vertices[face.indices[0]]))
+      face.u, face.v = scale(u, inset), scale(cross(face.normal, u), inset)
+   end
+   -- A scalar moment is exact for the regular solids; D10 uses the mean of its three principal moments.
+   local directions = array<table> { }
+   for _, edge in edges do
+      local direction = unit(sub(vertices[edge.b], vertices[edge.a]))
+      local duplicate = false
+      for _, other in directions do
+         if math.abs(dot(direction, other)) > 0.999999 then duplicate = true; break end
+      end
+      if not duplicate then directions.push(direction) end
+   end
+   local shape = { sides=Sides, vertices=vertices, faces=faces, edges=edges, directions=directions,
+      inertia=(2 / 3) * radial_moment / volume }
+   cache[Sides] = shape
+   return shape
+end
+
+-- Orthographic polygon area equals its model-space area times the camera-facing normal component.
+-- Back faces never win, including when transparency makes their markings visible.  Face order breaks exact ties.
+
+dice_shapes.winner = function(Shape:table!, Q:table!):<num, num, bool>
+   local value, best, second = 0, 0, 0
+   for _, face in Shape.faces do
+      local n = face.normal
+      local tx, ty, tz = 2 * (Q.y * n.z - Q.z * n.y), 2 * (Q.z * n.x - Q.x * n.z),
+         2 * (Q.x * n.y - Q.y * n.x)
+      local area = face.area * math.max(0, n.z + Q.w * tz + Q.x * ty - Q.y * tx)
+      if area > best then
+         value, second, best = face.value, best, area
+      elseif area > second then
+         second = area
+      end
+   end
+   return value, best, second > 0 and best - second <= 0.2 * (best + second)
+end

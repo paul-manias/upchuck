@@ -1,0 +1,535 @@
+-- In-session configuration window for Upchuck.  Applying settings rebuilds rendering and physics in the same process.
+
+   import 'gui', 'gui/window', 'gui/button', 'gui/checkbox', 'gui/combobox', 'gui/slider'
+   import 'gui/fontdialog', 'gui/menu'
+   import './shapes', './physics', './view'
+
+   include 'display'
+
+   module display as mGfx
+
+   namespace dice_options { }
+
+WINDOW_WIDTH  <const> = 470
+WINDOW_HEIGHT <const> = 360
+MARGIN        <const> = 24
+CONTROL_X     <const> = 132 -- Left edge of every control; labels are right-aligned against it
+TRACK_WIDTH   <const> = 260
+ROW_GAP       <const> = 12
+COLOUR_SIZE   <const> = 36
+COLOUR_GAP    <const> = 10
+CMYK          <const> = array<str> { '#00aeef', '#ec008c', '#fff200', '#231f20' }
+SECTOR_START  <const> = 0.125
+PREVIEW_GAP   <const> = 16     -- Space between the options window frame and the preview die
+PREVIEW_TICK  <const> = 1 / 60
+PREVIEW_SPIN  <const> = 1.2    -- Radians per second about the vertical axis
+PREVIEW_TILT  <const> = 0.45   -- Radians per second about the horizontal axis, so that every face comes into view
+
+-- Matches the label spacing used by the gui widget packages, so plain text labels line up with native ones.
+
+_, FONT_HEIGHT = gui.getFontHeight(gui.fonts.widget)
+LABEL_GAP <const> = math.floor(FONT_HEIGHT * 0.5) + 1
+
+function addText(Target:obj!, Text:str!, X:num!, Y:num!, Size:num, Weight:num, Align:str):obj
+   return Target.new('VectorText', table.merge({
+      x = X, y = Y, string = Text, face = gui.fonts.label.face,
+      fontSize  = (Size ?? gui.fonts.label.size) .. 'pt',
+      fontStyle = (Weight and Weight >= 600) ? 'bold' : gui.fonts.label.style,
+      align     = Align ?? 'left', lineLimit=1
+   }, gui.getTheme(Target).window.text))
+end
+
+function titleCase(Name:str!):str
+   return Name.sub(0, 1).upper() .. Name.sub(1)
+end
+
+function hexRGB(Hex:str!):<num, num, num>
+   return tonumber(Hex.sub(1, 3), 16) ?? 0, tonumber(Hex.sub(3, 5), 16) ?? 0, tonumber(Hex.sub(5, 7), 16) ?? 0
+end
+
+-- Choose a dark or light number colour for legibility against a '#rrggbb' body colour.
+
+function contrastColour(Hex:str!):str
+   red, green, blue = hexRGB(Hex)
+   luma = (red * 0.299) + (green * 0.587) + (blue * 0.114)
+   return (luma > 150) ? '#17191d' : '#fff8e8'
+end
+
+-- Build hard-edged conic gradient stops that divide the circle into equal sectors of '#rrggbb' colours.  A repeating
+-- conic gradient sweeps clockwise from the right, and SECTOR_START offsets the sectors so that four of them meet a
+-- square's corners, forming triangles (bottom, left, top, right).
+
+function sectorStops(Colours:array<str>!):table
+   stops = { }
+   add = function(Offset:num!, Hex:str!)
+      red, green, blue = hexRGB(Hex)
+      stop = struct<GradientStop>
+      stop.offset = Offset
+      stop.rgb.{ red = red / 255, green = green / 255, blue = blue / 255, alpha = 1 }
+      stops.insert(stop)
+   end
+
+   count = #Colours
+   add(0, Colours.last())
+   add(SECTOR_START, Colours.last())
+   for i, hex in Colours do
+      add(SECTOR_START + (i / count), hex)
+      add(math.min(1, SECTOR_START + ((i + 1) / count)), hex)
+   end
+   return stops
+end
+
+-- Native widget labels sit inside the widget's viewport, so shift the widget left until its control starts at
+-- CONTROL_X.  Width is the size of the control alone.
+
+function alignControl(Widget:table!, ControlX:num!, Width:num)
+   Widget.viewport.x = CONTROL_X - ControlX
+   if Width then Widget.viewport.width = ControlX + Width end
+end
+
+dice_options.open = function(Settings:table!, Themes:array<table>!, OnApply:func!, OnClosed:func!):table
+   state = { settings=Settings, colourSlots=array<table>, closing=false }
+   update_rows:func
+   refresh_colour:func
+   close_preview:func
+   active_colour = 0
+
+   finish = function(Apply:bool!, FreeWindow:bool!)
+      if state.closing then return end
+      if Apply then OnApply(state.settings) end
+      state.closing = true
+      state.colourMenu?.hide()
+      close_preview()
+      OnClosed()
+      if FreeWindow then
+         processing.delayedCall(function() state.window.surface?.free() end)
+      end
+   end
+
+   state.window = gui.window({
+      title = 'Upchuck Options',
+      icon = 'tools/cog',
+      insideWidth = WINDOW_WIDTH, insideHeight = WINDOW_HEIGHT,
+      minWidth = WINDOW_WIDTH/3, minHeight = WINDOW_HEIGHT/3,
+      maxWidth = WINDOW_WIDTH*2, maxHeight = WINDOW_HEIGHT*2,
+      aspectRatio = true,
+      quit = false,
+      events = {
+         close = function()
+            finish(false, false)
+         end
+      }
+   })
+
+   client = state.window.clientViewport({
+      viewX = 0, viewY = 0, viewWidth = WINDOW_WIDTH, viewHeight = WINDOW_HEIGHT,
+      aspectRatio = ARF_X_MID|ARF_Y_MID|ARF_MEET
+   })
+   theme = state.window.theme
+
+   -- Slider readouts follow the track, on the baseline of the slider's own label.
+
+   add_readout = function(Slider:table!, Text:str!):obj
+      return addText(client, Text, CONTROL_X + TRACK_WIDTH + LABEL_GAP,
+         Slider.viewport.y + Slider.labelText.y, nil, 400)
+   end
+
+   -- Widgets use weak callbacks, so retain them with the options window until it closes.
+
+   row_y = MARGIN
+   count_value:obj
+   state.countSlider = gui.slider({
+      target = client,
+      y      = row_y,
+      label  = 'Dice Count',
+      min    = 1, max = 6, step = 1,
+      ticks  = true,
+      value  = Settings.diceCount,
+      events = {
+         activate = function(Value:num!)
+            state.settings.diceCount = Value
+            count_value.string = tostring(Value)
+            update_rows()
+         end
+      }
+   })
+   alignControl(state.countSlider, state.countSlider.trackVP.x, TRACK_WIDTH)
+   count_value = add_readout(state.countSlider, tostring(Settings.diceCount))
+   row_y += state.countSlider.viewport.height + ROW_GAP
+
+   state.sidesCombo = gui.combobox({
+      target = client,
+      y      = row_y,
+      label  = 'Sides',
+      text   = 'D' .. Settings.sides,
+      items  = array<table> {
+         { label='D4', num=4 }, { label='D6', num=6 }, { label='D8', num=8 },
+         { label='D10', num=10 }, { label='D12', num=12 }, { label='D20', num=20 }
+      },
+      events = {
+         activate = function(Value:any!)
+            if Value is <table> then
+               state.settings.sides = Value.num
+               state.preview.dirty = true
+            end
+         end
+      }
+   })
+   alignControl(state.sidesCombo, state.sidesCombo.inputViewport.x, 130)
+   row_y += state.sidesCombo.viewport.height + ROW_GAP
+
+   colours_y = row_y
+   addText(client, 'Colours', CONTROL_X - LABEL_GAP, colours_y + (COLOUR_SIZE * 0.5) + 5, nil, 400, 'right')
+
+   colour_menu_items = array<table> { { label='Random', value=nil } }
+   for _, die_theme in Themes do
+      colour_menu_items.push({
+         label = titleCase(die_theme.name),
+         value = die_theme.name
+      })
+   end
+
+   state.colourMenu = gui.menu({
+      target    = state.window.surface,
+      config    = colour_menu_items,
+      showIcons = false,
+      popup     = true,
+      onActivate = function(Item:table!)
+         state.settings.dice[active_colour].theme = Item.value
+         refresh_colour(active_colour)
+         state.preview.dirty = true
+      end
+   })
+
+   find_theme = function(Name:str):table
+      if not Name then return nil end
+      for _, die_theme in Themes do
+         if die_theme.name is Name then return die_theme end
+      end
+   end
+
+   -- Each slot is a button whose themed background is a conic gradient defined for that slot.  Changing a colour
+   -- only updates the gradient's stops, so the buttons keep their focus and tab order.  A themed slot is a solid
+   -- body colour; a random slot shows CMYK triangles meeting at the centre, with a dark halo behind its number.
+
+   refresh_colour = function(Slot:num!)
+      control = state.colourSlots[Slot]
+      selected = find_theme(state.settings.dice[Slot].theme)
+      control.gradient.stops = selected ? sectorStops(array<str> { selected.body }) : sectorStops(CMYK)
+      control.button.text.fill = selected ? contrastColour(selected.body) : '#ffffff'
+      control.halo.visibility = selected ? VIS_HIDDEN : VIS_VISIBLE
+      control.button.viewport.acDraw()
+   end
+
+   for i in {0 to 6} do
+      slot = i
+      fill = f'url(#colourSlot{i})'
+      gradient = client.scene.new('GradientConic', { stops=sectorStops(CMYK), spreadMethod='repeat' })
+      check client.scene.mtAddDef(f'colourSlot{i}', gradient)
+
+      button = gui.button({
+         target = client,
+         x      = CONTROL_X + (i * (COLOUR_SIZE + COLOUR_GAP)),
+         y      = colours_y,
+         width  = COLOUR_SIZE,
+         height = COLOUR_SIZE,
+         label  = tostring(i + 1),
+         theme  = {
+            bkgd      = { fill = fill },
+            highlight = { fill = fill, stroke = theme.button.highlight.fill },
+            text      = { fontStyle = 'bold' }
+         },
+         events = {
+            activate = function()
+               active_colour = slot
+               state.preview.slot = slot
+               state.preview.dirty = true
+               if state.colourMenu.visible then state.colourMenu.hide() end
+               state.colourMenu.{
+                  x = CONTROL_X + (slot * (COLOUR_SIZE + COLOUR_GAP)),
+                  y = colours_y + COLOUR_SIZE
+               }
+               state.colourMenu.show()
+            end
+         }
+      })
+
+      button.text.{ x = (COLOUR_SIZE * 0.5) - theme.button.bkgd.strokeWidth, align = 'middle' }
+
+      -- The halo is a dark outline behind the number, keeping it legible across the random slot's colours.
+
+      halo = button.text.parent.new('VectorText', {
+         x=button.text.x, y=button.text.y, string=button.text.string, align='middle',
+         face=button.text.face, fontSize=button.text.fontSize, fontStyle=button.text.fontStyle,
+         fill='#000000', stroke='#000000c0', strokeWidth=3
+      })
+      halo.acMoveToBack()
+
+      state.colourSlots.push({ button=button, gradient=gradient, halo=halo })
+      refresh_colour(i)
+   end
+
+   row_y = colours_y + COLOUR_SIZE + ROW_GAP + 4
+
+   size_value:obj
+   state.sizeSlider = gui.slider({
+      target = client,
+      y      = row_y,
+      label  = 'Size',
+      min    = 0.25,
+      max    = Settings.maxScale,
+      step   = 0.05,
+      value  = Settings.scale,
+      events = {
+         activate = function(Value:num!)
+            state.settings.scale = Value
+            size_value.string = string.format('%.2fx', Value)
+            state.preview.dirty = true
+            client.acDraw()
+         end
+      }
+   })
+   alignControl(state.sizeSlider, state.sizeSlider.trackVP.x, TRACK_WIDTH)
+   size_value = add_readout(state.sizeSlider, string.format('%.2fx', Settings.scale))
+   row_y += state.sizeSlider.viewport.height + ROW_GAP
+
+   -- D6 faces are drawn with pips or numbered in the chosen font, so the font is offered as the alternative to pips.
+
+   face_items = function():array<table>
+      return array<table> { { label='Pips', face='pips' }, { label=state.settings.font, face='num' } }
+   end
+
+   state.faceCombo = gui.combobox({
+      target = client,
+      y      = row_y,
+      label  = 'D6 Faces',
+      text   = (Settings.face is 'num') ? Settings.font : 'Pips',
+      items  = face_items(),
+      events = {
+         activate = function(Value:any!)
+            if Value is <table> then
+               state.settings.face = Value.face
+               state.preview.dirty = true
+            end
+         end
+      }
+   })
+   alignControl(state.faceCombo, state.faceCombo.inputViewport.x, 180)
+
+   state.fontButton = gui.button({
+      target = client,
+      x      = CONTROL_X + 180 + LABEL_GAP,
+      y      = row_y,
+      width  = 70,
+      label  = 'Font',
+      events = {
+         activate = function()
+            gui.dialog.font({
+               face      = state.settings.font,
+               pointSize = 12,
+               style     = 'Bold',
+               modal     = true,
+               popOver   = state.window.surface,
+               feedback  = function(Accepted:bool)
+                  if Accepted then state.setFont(&face) end
+               end
+            })
+         end
+      }
+   })
+   state.fontButton.viewport.y = row_y + ((state.faceCombo.viewport.height - state.fontButton.viewport.height) * 0.5)
+   row_y += state.faceCombo.viewport.height + ROW_GAP
+
+   -- Choosing a font renames the numbered option and selects it.
+
+   state.setFont = function(Face:str!)
+      state.settings.font = Face
+      state.settings.face = 'num'
+      state.faceCombo.setItems(face_items())
+      state.faceCombo.setText(Face)
+      state.preview.dirty = true
+   end
+
+   state.shadingToggle = gui.checkbox({
+      target = client,
+      x      = CONTROL_X,
+      y      = row_y,
+      label  = 'Shading',
+      value  = Settings.shading ? 1 : 0,
+      events = {
+         activate = function()
+            state.settings.shading = state.shadingToggle.value is 1
+            state.preview.dirty = true
+         end
+      }
+   })
+   row_y += state.shadingToggle.viewport.height + ROW_GAP
+
+   opacity_value:obj
+   state.opacitySlider = gui.slider({
+      target = client,
+      y      = row_y,
+      label  = 'Opacity',
+      min    = 0.2, max = 1,
+      step   = 0.05,
+      value  = Settings.opacity,
+      events = {
+         activate = function(Value:num!)
+            state.settings.opacity = Value
+            opacity_value.string = f'{math.round(Value * 100)}%'
+            state.preview.dirty = true
+            client.acDraw()
+         end
+      }
+   })
+   alignControl(state.opacitySlider, state.opacitySlider.trackVP.x, TRACK_WIDTH)
+   opacity_value = add_readout(state.opacitySlider, f'{math.round(Settings.opacity * 100)}%')
+
+   buttons_y = WINDOW_HEIGHT - 46
+
+   state.applyButton = gui.button({
+      target  = client,
+      xOffset = MARGIN,
+      y       = buttons_y,
+      label   = 'Roll',
+      events  = {
+         activate = function()
+            finish(true, true)
+         end
+      }
+   })
+
+   state.cancelButton = gui.button({
+      target  = client,
+      xOffset = state.applyButton.viewport.width + 12 + MARGIN,
+      y       = buttons_y,
+      label   = 'Cancel',
+      events = {
+         activate = function()
+            finish(false, true)
+         end
+      }
+   })
+
+   state.quitButton = gui.button({
+      target  = client,
+      x       = MARGIN,
+      y       = buttons_y,
+      width   = 100,
+      label   = 'Quit',
+      events = {
+         activate = function()
+            mSys.SendMessage(MSGID_QUIT)
+         end
+      }
+   })
+
+   update_rows = function()
+      for i, control in state.colourSlots do
+         visible = i < state.settings.diceCount
+         control.button.viewport.opacity = visible ? 1 : 0.38
+      end
+      client.acDraw()
+   end
+
+   -- The preview is a transparent window beside the options, spinning one die in the colour of the most recently
+   -- chosen slot.  Edits mark it dirty and the die is rebuilt on the next animation tick, so a slider drag rebuilds
+   -- at most once per frame.  A random slot previews a randomly chosen colour that stays fixed while the window is
+   -- open.
+
+   state.preview = {
+      slot = 0, dirty = true, randomThemes = { },
+      q = dice_physics.axisAngle(1, 0.35, 0.2, 0.85)
+   }
+   preview = state.preview
+
+   preview_theme = function():table
+      selected = find_theme(state.settings.dice[preview.slot].theme)
+      if selected then return selected end
+      preview.randomThemes[preview.slot] ?= Themes[math.random(0, #Themes - 1)]
+      return preview.randomThemes[preview.slot]
+   end
+
+   -- Sit to the right of the options window frame, vertically centred against it.  Move to the left side if the
+   -- preview would leave the monitor.
+
+   place_preview = function()
+      if not preview.window then return end
+      surface = state.window.surface
+      size = preview.window.surface.width
+      err, left, top, right, bottom = surface.display.mtGetFrame(0)
+      if err != ERR_Okay then left, top, right, bottom = 0, 0, 0, 0 end
+      x = surface.x + surface.width + right + PREVIEW_GAP
+      y = surface.y + ((surface.height - size) * 0.5)
+      err, info = mGfx.GetDisplayInfo(surface.display)
+      if err is ERR_Okay and info.monitorWidth > 0 then
+         if x + size > info.monitorX + info.monitorWidth then x = surface.x - left - PREVIEW_GAP - size end
+         y = math.max(info.monitorY, math.min(y, info.monitorY + info.monitorHeight - size))
+      end
+      preview.window.surface.acMoveToPoint(x, y, 0, MTF_X|MTF_Y)
+   end
+
+   rebuild_preview = function()
+      preview.dirty = false
+      layout = dice_view.layout(state.settings.scale)
+      if preview.view then dice_view.free(preview.view) end
+      surface = preview.window.surface
+      if surface.width != layout.size or surface.height != layout.size then
+         surface.acResize(layout.size, layout.size, 0)
+         place_preview()
+      end
+
+      preview.view = dice_view.new(preview.root, dice_shapes.get(state.settings.sides), preview_theme(), {
+         radius=layout.radius, cornerRadius=layout.cornerRadius, centre=layout.centre,
+         shading=state.settings.shading, opacity=state.settings.opacity,
+         face=state.settings.face, font=state.settings.font
+      })
+   end
+
+   close_preview = function()
+      if preview.timer then
+         mSys.UpdateTimer(preview.timer, 0)
+         preview.timer = nil
+      end
+      preview.view = nil
+      preview.window?.surface?.free()
+      preview.window = nil
+   end
+
+   layout = dice_view.layout(Settings.scale)
+   preview.window = gui.window({
+      title = 'Upchuck Preview', presence = SPT_NONE, composite = true,
+      insideWidth = layout.size, insideHeight = layout.size, quit = false
+   })
+   preview.window.bkgd.fill = '#00000000'
+   preview.root = preview.window.clientViewport()
+
+   _, preview.timer = check mSys.SubscribeTimer(PREVIEW_TICK, function(Subscriber, Elapsed, CurrentTime)
+      if state.closing or not preview.window then return end
+      if preview.dirty then rebuild_preview() end
+      dt = preview.lastTime ? math.min(0.1, (CurrentTime - preview.lastTime) / 1000000) : PREVIEW_TICK
+      preview.lastTime = CurrentTime
+      preview.q = dice_physics.quatMultiply(dice_physics.axisAngle(1, 0, 0, PREVIEW_TILT * dt),
+         dice_physics.quatMultiply(dice_physics.axisAngle(0, 1, 0, PREVIEW_SPIN * dt), preview.q))
+      dice_view.draw(preview.view, preview.q, false)
+      preview.window.surface.mtScheduleRedraw()
+   end)
+
+   -- Host moves and resizes of the options window are reported as Redimension.
+
+   state.window.surface.subscribe('redimension', function()
+      place_preview()
+   end)
+
+   state.window.surface.subscribe('free', function()
+      close_preview()
+   end)
+
+   update_rows()
+   state.window.show(true)
+   rebuild_preview()
+   dice_view.draw(preview.view, preview.q, false)
+   place_preview()
+   preview.window.show()
+   return state
+end

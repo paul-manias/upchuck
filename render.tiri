@@ -1,0 +1,173 @@
+-- Direct surface rendering.  Keep the scene graph unchanged while an action is outstanding.
+
+   include 'display', 'vector'
+   namespace dice_render { }
+
+function cross2(O:table!, A:table!, B:table!):num
+   return ((A.x - O.x) * (B.y - O.y)) - ((A.y - O.y) * (B.x - O.x))
+end
+
+function convexHull(Points:array<table>!):array<table>
+   sorted = Points.clone()
+   sorted.sort(function(A:table!, B:table!):bool
+      return (A.x is B.x) ? (A.y < B.y) : (A.x < B.x)
+   end)
+
+   lower = array<table> { }
+   for _, point in sorted do
+      while (#lower >= 2) and (cross2(lower[#lower - 2], lower[#lower - 1], point) <= 0) do lower.pop() end
+      lower.push(point)
+   end
+
+   upper = array<table> { }
+   for i in {#sorted - 1 into 0 by -1} do
+      point = sorted[i]
+      while (#upper >= 2) and (cross2(upper[#upper - 2], upper[#upper - 1], point) <= 0) do upper.pop() end
+      upper.push(point)
+   end
+
+   lower.pop()
+   upper.pop()
+   for _, point in upper do lower.push(point) end
+
+   -- Face-on cubes project front and rear vertices onto almost identical positions.  Tiny hull edges would
+   -- limit rounding to half their length, leaving apparently square corners.  Merge neighbours within the
+   -- path's 0.001-pixel coordinate precision, including the closing edge.
+
+   i = 0
+   while #lower > 3 and i < #lower do
+      previous, point = lower[(i + #lower - 1) % #lower], lower[i]
+      dx, dy = point.x - previous.x, point.y - previous.y
+      if dx * dx + dy * dy <= 0.000001 then
+         lower.remove(i)
+      else
+         i++
+      end
+   end
+
+   return lower
+end
+
+function pathSequence(Points:array<table>!):str
+   sequence = string.format('M %.3f,%.3f', Points[0].x, Points[0].y)
+   for i in {1 to #Points} do sequence ..= string.format(' L %.3f,%.3f', Points[i].x, Points[i].y) end
+   return sequence .. ' Z'
+end
+
+function roundedPathSequence(Points:array<table>!, Radius:num!, SquareCorners:table):str
+   sequence = ''
+   for i, point in Points do
+      if SquareCorners and SquareCorners[i] then
+         sequence ..= string.format('%s %.3f,%.3f ', (i is 0) ? 'M' : 'L', point.x, point.y)
+         continue
+      end
+
+      previous = Points[(i + #Points - 1) % #Points]
+      following = Points[(i + 1) % #Points]
+      px, py = previous.x - point.x, previous.y - point.y
+      nx, ny = following.x - point.x, following.y - point.y
+      previous_length = math.sqrt(px * px + py * py)
+      next_length = math.sqrt(nx * nx + ny * ny)
+      inset = math.min(Radius, previous_length * 0.5, next_length * 0.5)
+      entry = inset / previous_length
+      exit = inset / next_length
+
+      sequence ..= string.format('%s %.3f,%.3f Q %.3f,%.3f %.3f,%.3f ',
+         (i is 0) ? 'M' : 'L', point.x + px * entry, point.y + py * entry,
+         point.x, point.y, point.x + nx * exit, point.y + ny * exit)
+   end
+   return sequence .. 'Z'
+end
+
+-- Offset the convex hull inwards, then restore its size with circular arcs.  Short bevel edges can
+-- disappear from the inset polygon instead of forcing adjacent corners to use a smaller radius.
+
+function roundedHullSequence(Points:array<table>!, Radius:num!):str
+   if Radius <= 0 then return pathSequence(Points) end
+   inset = Points
+   for i, a in Points do
+      b = Points[(i + 1) % #Points]
+      dx, dy = b.x - a.x, b.y - a.y
+      length = math.sqrt(dx * dx + dy * dy)
+      if length < 0.000001 then continue end
+      nx, ny = -dy / length, dx / length
+      limit = nx * a.x + ny * a.y + Radius
+      clipped = array<table> { }
+      previous = inset[#inset - 1]
+      previous_d = nx * previous.x + ny * previous.y - limit
+      for _, point in inset do
+         d = nx * point.x + ny * point.y - limit
+         if (d >= 0) != (previous_d >= 0) then
+            fraction = previous_d / (previous_d - d)
+            clipped.push({ x=previous.x + (point.x - previous.x) * fraction,
+               y=previous.y + (point.y - previous.y) * fraction })
+         end
+         if d >= 0 then clipped.push(point) end
+         previous, previous_d = point, d
+      end
+      -- Keep a usable outline if an exceptionally small projection cannot contain the requested radius.
+      if #clipped < 3 then return roundedPathSequence(Points, Radius) end
+      inset = clipped
+   end
+
+   inset = convexHull(inset)
+   sequence = ''
+   for i, point in inset do
+      previous = inset[(i + #inset - 1) % #inset]
+      following = inset[(i + 1) % #inset]
+      px, py = point.x - previous.x, point.y - previous.y
+      nx, ny = following.x - point.x, following.y - point.y
+      before = Radius / math.sqrt(px * px + py * py)
+      after = Radius / math.sqrt(nx * nx + ny * ny)
+      sequence ..= string.format('%s %.3f,%.3f A %.3f,%.3f 0 0 1 %.3f,%.3f ',
+         i is 0 ? 'M' : 'L', point.x + py * before, point.y - px * before,
+         Radius, Radius, point.x + ny * after, point.y - nx * after)
+   end
+
+   return sequence .. 'Z'
+end
+
+dice_render.roundedHullSequence = roundedHullSequence
+dice_render.convexHull = convexHull
+dice_render.pathSequence = pathSequence
+dice_render.roundedPathSequence = roundedPathSequence
+
+dice_render.new = function(Scene:obj!, Surface:obj!):table
+   bitmap = Surface.buffer
+
+   Scene.bitmap = bitmap
+   Scene.flags = Scene.flags | VPF_MANUAL_RENDER | VPF_RENDER_TIME
+   Surface.flags = Surface.flags | RNF_MANUAL_RENDER
+
+   renderer = { scene=Scene, busy=false, closed=false, failure=nil, completed=0, elapsed=0, rasterTime=0 }
+
+   renderer.submit = function():bool
+      if renderer.closed then raise 'Dice renderer is closed.' end
+      if renderer.failure then raise renderer.failure end
+      if renderer.busy then return false end
+      renderer.busy = true
+      started = mSys.PreciseTime()
+
+      async.action(Scene, 'Draw', function(ActionID, Object, Error, Key)
+         renderer.completed++
+         renderer.rasterTime += Scene.renderTime
+         renderer.elapsed += mSys.PreciseTime() - started
+         if not renderer.closed then
+            -- Keep busy set while Flush dispatches input callbacks: they may request a newer pose.
+            Scene.acFlush()
+            Surface.mtExposeToDisplay(0, 0, Surface.width, Surface.height, 0)
+         end
+         renderer.busy = false
+      end, 0)
+      return true
+   end
+
+   renderer.close = function()
+      renderer.closed = true
+      while renderer.busy do
+         local err = async.wait(Scene, 0.1)
+         if err != ERR_Okay and err != ERR_Timeout and err != ERR_Terminate then check err end
+      end
+   end
+   return renderer
+end

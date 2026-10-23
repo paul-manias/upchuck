@@ -1,0 +1,192 @@
+   import '../dice_async'
+   import '../dice_physics'
+   import '../dice_shapes'
+   import '../dice_replay'
+
+function makeThrow(X:num!, Sides:num):str
+   local shape = dice_shapes.get(Sides ?? 6)
+   local dice = array<table> { {
+      theme={ name='white' },
+      state={
+         shape=shape, x=X, y=200, vx=100, vy=0, wx=0.2, wy=0.3, wz=0.4,
+         q={ w=1, x=0, y=0, z=0 }, groundTime=0, stopped=false, roll=1, frame=0
+      }
+   } }
+   return dice_replay.capture(dice, dice_physics.newWorld(72, 0, 1920, 1080), 1)
+end
+
+function newWorker(Throw:str!):table
+   return dice_async.new(obj.find('self').workingPath .. '../apps/dice_worker.tiri', Throw)
+end
+
+function waitSnapshot(Worker:table!, Predicate:func!):table
+   local deadline = mSys.PreciseTime() + 3000000
+   repeat
+      local snapshot = Worker.read()
+      if snapshot and Predicate(snapshot) then return snapshot end
+      processing.sleep(0.01)
+   until mSys.PreciseTime() > deadline
+   raise 'Timed out waiting for dice physics snapshot.'
+end
+
+@Test function WorkerAdvancesWithoutMainThreadProcessing()
+   local worker = newWorker(makeThrow(500))
+   defer worker.close() end
+   local first = waitSnapshot(worker, s => bool: s.simulationTime > 0)
+   local until_time = mSys.PreciseTime() + 150000
+   while mSys.PreciseTime() < until_time do end
+   local next_snapshot = worker.read()
+   assert(next_snapshot and next_snapshot.simulationTime > first.simulationTime + 0.05,
+      'Physics must progress while the main thread cannot dispatch timers or draw')
+   assert(next_snapshot.states[0].y > first.states[0].y, 'Gravity must advance the body')
+end
+
+@Test function WorkerMatchesFixedStepSolver()
+   local initial = makeThrow(500, 12)
+   local worker = newWorker(initial)
+   defer worker.close() end
+   local snapshot = waitSnapshot(worker, s => bool: s.simulationTime >= 0.05)
+   local replay = dice_replay.decode(initial)
+   local body = replay.dice[0].state
+   local bodies = array<table> { body }
+   local steps = math.round(snapshot.simulationTime / replay.world.step)
+   for _ in {0 to steps} do dice_physics.advance(bodies, replay.world, replay.world.step) end
+   local actual = snapshot.states[0]
+   assert(math.abs(body.x - actual.x) < 0.000001 and math.abs(body.y - actual.y) < 0.000001,
+      'The worker must preserve the existing fixed-step trajectory')
+   for _, key in array<str> { 'w', 'x', 'y', 'z' } do
+      assert(math.abs(body.q[key] - actual.q[key]) < 0.000001, 'Worker orientation must match direct simulation')
+   end
+end
+
+@Test function PauseAndRethrowRejectStaleSnapshots()
+   local worker = newWorker(makeThrow(300))
+   defer worker.close() end
+   waitSnapshot(worker, s => bool: s.simulationTime > 0)
+   worker.pause()
+   local paused = waitSnapshot(worker, s => bool: s.paused)
+   processing.sleep(0.05)
+   assert(worker.read() is nil, 'Paused worker must not publish further motion')
+   worker.reset(makeThrow(700))
+   worker.pause()
+   worker.reset(makeThrow(1200), true)
+   local reset = waitSnapshot(worker, s => bool: not s.paused)
+   assert(reset.generation > paused.generation and reset.states[0].x >= 1200,
+      'Old throw snapshots must not overwrite a new throw')
+   waitSnapshot(worker, s => bool: s.simulationTime >= 0.05)
+   local metrics = worker.close()
+   assert(metrics and metrics.stepMS.count > 0, 'Joining the worker must return its completed timing report')
+   assert(worker.close() is nil, 'Repeated cleanup must be harmless')
+end
+
+@Test function ImpactsSurviveSkippedSnapshotsAndAreAcknowledged()
+   local worker = newWorker(makeThrow(500))
+   defer worker.close() end
+   waitSnapshot(worker, s => bool: s.simulationTime >= 0.8)
+   local until_time = mSys.PreciseTime() + 350000
+   while mSys.PreciseTime() < until_time do end
+   local first = worker.read()
+   assert(first and #first.impacts > 0, 'Impacts must survive snapshots skipped during a blocked UI')
+   local seen = first.impacts[#first.impacts - 1].id
+   assert(first.impacts[0].speed >= 40, 'A floor collision must retain its impact speed')
+   processing.sleep(0.08)
+   local next_snapshot = waitSnapshot(worker, s => bool: s.sequence > first.sequence)
+   for _, impact in next_snapshot.impacts do
+      assert(impact.id > seen, 'Acknowledged collisions must never play twice')
+   end
+end
+
+@Test function WorkerFailureReachesTheCaller()
+   local worker = newWorker('invalid replay')
+   local caught = false
+   try
+      waitSnapshot(worker, s => bool: true)
+   except e
+      caught = e.message.find('Dice physics worker') != nil
+   end
+   assert(caught, 'Worker failures must be visible on the main thread')
+   caught = false
+   try
+      worker.close()
+   except e
+      caught = e.message.find('Dice physics worker') != nil
+   end
+   assert(caught, 'Shutdown must propagate a worker failure after joining and clearing its pool keys')
+   assert(worker.close() is nil, 'A failed worker must still finish cleanup')
+end
+
+@Test function WorkerCanBeClosedBeforeItsFirstSnapshot()
+   local worker = newWorker(makeThrow(500))
+   local metrics = worker.close()
+   assert(metrics != nil, 'A cold worker must finish before shutdown releases its shared pool')
+end
+
+@Test function SleepingWorkerWakesForANewThrow()
+   local replay = dice_replay.decode(makeThrow(500))
+   local state = replay.dice[0].state
+   state.stopped = true
+   state.vx, state.vy, state.wx, state.wy, state.wz = 0, 0, 0, 0, 0
+   local initial = dice_replay.capture(array<table> { { theme={ name='white' }, state=state } }, replay.world, 1)
+   local worker = newWorker(initial)
+   defer worker.close() end
+   waitSnapshot(worker, s => bool: s.states[0].stopped)
+   processing.sleep(0.05)
+   assert(worker.read() is nil, 'Sleeping bodies must not generate repeated snapshots')
+   worker.reset(makeThrow(500))
+   local awake = waitSnapshot(worker, s => bool: s.simulationTime > 0)
+   assert(not awake.states[0].stopped, 'A new throw must wake an idle worker')
+end
+
+@Test function WorkerPreservesSpherePairCollisionMode()
+   local replay = dice_replay.decode(makeThrow(500, 12))
+   replay.world.collisions = 'sphere'
+   local a = replay.dice[0].state
+   local b = dice_replay.decode(makeThrow(700, 20)).dice[0].state
+   a.vx, b.vx = 100, -100
+   local initial = dice_replay.capture(array<table> {
+      { theme={ name='white' }, state=a }, { theme={ name='red' }, state=b }
+   }, replay.world, 1)
+   local worker = newWorker(initial)
+   defer worker.close() end
+   local snapshot = waitSnapshot(worker, s => bool: s.simulationTime >= 0.05)
+   local bodies = array<table> { a, b }
+   local steps = math.round(snapshot.simulationTime / replay.world.step)
+   for _ in {0 to steps} do dice_physics.advance(bodies, replay.world, replay.world.step) end
+   for i, actual in snapshot.states do
+      assert(math.abs(actual.x - bodies[i].x) < 0.000001 and math.abs(actual.vx - bodies[i].vx) < 0.000001,
+         'Worker must reproduce sphere contacts rather than silently reverting to convex collisions')
+   end
+end
+
+@Test function SnapshotCadenceDoesNotThrottlePhysics()
+   local replay = dice_replay.decode(makeThrow(500))
+   replay.world.gravity = 0
+   local initial = dice_replay.capture(array<table> { { theme={ name='white' }, state=replay.dice[0].state } },
+      replay.world, 1)
+   local worker = newWorker(initial)
+   defer worker.close() end
+   worker.reset(initial, true)
+   local first = waitSnapshot(worker, s => bool: s.simulationTime > 0)
+   local last = waitSnapshot(worker, s => bool: s.simulationTime >= 0.3)
+   local elapsed = (last.time - first.time) / 1000000
+   assert(last.sequence - first.sequence <= math.ceil(elapsed * 60) + 1,
+      'Regular snapshots must follow drawing cadence, including while catching up')
+   local metrics = worker.close()
+   assert(metrics.stepMS.count > metrics.publishMS.count * 1.5,
+      'Physics must continue stepping between snapshot publications')
+end
+
+@Test function FinalRestingSnapshotIsPublishedBeforeWorkerSleeps()
+   local replay = dice_replay.decode(makeThrow(500))
+   local state = replay.dice[0].state
+   state.y = replay.world.bottom - replay.world.radius
+   state.vx, state.vy, state.wx, state.wy, state.wz = 0, 0, 0, 0, 0
+   state.groundTime = 0.499
+   local initial = dice_replay.capture(array<table> { { theme={ name='white' }, state=state } }, replay.world, 1)
+   local worker = newWorker(initial)
+   defer worker.close() end
+   local final = waitSnapshot(worker, s => bool: s.states[0].stopped)
+   assert(final.simulationTime < 1 / 60, 'A resting state must publish before the next regular drawing deadline')
+   processing.sleep(0.05)
+   assert(worker.read() is nil, 'The worker must remain idle after publishing its final pose')
+end

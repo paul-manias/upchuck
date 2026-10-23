@@ -1,0 +1,83 @@
+-- Repeatable wall-clock benchmark.  Times measure solver and scene updates; rasterisation occurs outside the callback.
+
+   import 'json'
+   namespace dice_benchmark { }
+
+function statistics(Samples:array<double>!):table
+   if #Samples is 0 then return { count=0, mean=0, p95=0, max=0 } end
+   total = 0
+   for _, value in Samples do total += value end
+   sorted = Samples.clone()
+   sorted.sort()
+   return {
+      count=#Samples, mean=total / #Samples,
+      p95=sorted[math.max(0, math.ceil(#sorted * 0.95) - 1)], max=sorted[#sorted - 1]
+   }
+end
+
+dice_benchmark.new = function(Duration:num!, Stall:num!):table
+   start = mSys.PreciseTime() / 1000000
+   warmup = 2
+   next_reset = start + warmup
+   next_stall = start + 1
+   previous_tick = start
+   measured = 0
+   ended = 0
+   ages, lags = array<double> { }, array<double> { }
+   intervals, physics = array<double> { }, array<double> { }
+   render, callback = array<double> { }, array<double> { }
+
+   return {
+      finished = function():bool
+         now = mSys.PreciseTime() / 1000000
+         if now < start + warmup + Duration then return false end
+         ended = now
+         return true
+      end,
+      reset = function():bool
+         now = mSys.PreciseTime() / 1000000
+         if now < next_reset then return false end
+         next_reset = now + 2
+         return true
+      end,
+      record = function(Tick:num!, Update:num!, Render:num!, Callback:num!, Rendered:bool!)
+         interval = Tick / 1000000 - previous_tick
+         previous_tick = Tick / 1000000
+         if previous_tick < start + warmup then return end
+         if measured is 0 then measured = previous_tick end
+         intervals.push(interval * 1000)
+         physics.push(Update / 1000)
+         if Rendered then render.push(Render / 1000) end
+         callback.push(Callback / 1000)
+      end,
+      observe = function(Snapshot:table!)
+         if mSys.PreciseTime() / 1000000 < start + warmup then return end
+         ages.push((mSys.PreciseTime() - Snapshot.time) / 1000)
+         lags.push(Snapshot.lag * 1000)
+      end,
+      stall = function()
+         now = mSys.PreciseTime() / 1000000
+         if Stall <= 0 or now < next_stall then return end
+         next_stall = now + 1
+         -- Deliberately block message processing, as a slow renderer would.  Main-thread WaitTime pumps messages.
+         until_time = mSys.PreciseTime() + Stall * 1000
+         while mSys.PreciseTime() < until_time do end
+      end,
+      report = function(Mode:str!, Count:num!, Sides:str!, Worker:table, Rendering:table)
+         elapsed = (ended > 0 ? ended : mSys.PreciseTime() / 1000000) - measured
+         print('[Upchuck benchmark] ' .. json.encode({
+            mode=Mode, dice=Count, sides=Sides, rendering=Rendering,
+            seconds=Duration, warmup=warmup, stallMS=Stall,
+            frames=#intervals, measuredSeconds=elapsed, callbackHz=measured > 0 ? #intervals / elapsed : 0,
+            intervalMS=statistics(intervals),
+            physicsMS=Mode is 'main' ? statistics(physics) : nil,
+            snapshotReadMS=Mode is 'worker' ? statistics(physics) : nil,
+            sceneMS=statistics(render), sceneHz=measured > 0 ? #render / elapsed : 0,
+            callbackMS=statistics(callback), worker=Worker,
+            snapshotAgeMS=statistics(ages), simulationLagMS=statistics(lags)
+         }))
+      end
+   }
+end
+
+dice_benchmark.statistics = statistics

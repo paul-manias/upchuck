@@ -1,0 +1,891 @@
+-- Deterministic physics regressions, independent of windows, timers and rendering.
+
+   import '../shapes'
+   import '../physics'
+   import '../dev/replay'
+
+function body(X:num!, Y:num!):table
+   return {
+      x=X, y=Y, vx=0, vy=0, wx=0, wy=0, wz=0,
+      q={ w=1, x=0, y=0, z=0 }, stopped=false, groundTime=0
+   }
+end
+
+function energy(B:table!, World:table!):num
+   local inertia = B.shape ? B.shape.inertia * World.radius * World.radius : World.inertia
+   return 0.5 * (B.vx * B.vx + B.vy * B.vy + inertia * (B.wx * B.wx + B.wy * B.wy + B.wz * B.wz))
+end
+
+function lowest(B:table!, World:table!):num
+   local y = -math.huge
+   for _, point in dice_physics.geometry(B, World.radius).vertices do y = math.max(y, point.y) end
+   return y
+end
+
+@Test function WallImpactsRemainPassive()
+   for scale in values(array<double> { 1, 3 }) do
+      local world = dice_physics.newWorld(72 * scale, 0, 4000, 4000)
+      local b = body(world.radius, 500)
+      b.vx, b.wy = -500, -10
+      local before = energy(b, world)
+      local contacts = dice_physics.contacts(array<table> { b }, world)
+      dice_physics.solve(contacts, world)
+      assert(energy(b, world) <= before * 1.000001, 'Wall impacts must not generate kinetic energy')
+      assert(b.vx > 0, 'An approaching cube must rebound from the left wall')
+   end
+end
+
+@Test function SeparatingWallContactDoesNotBounce()
+   local world = dice_physics.newWorld(72, 0, 2000, 1000)
+   local b = body(72, 500)
+   b.vx = 200
+   dice_physics.solve(dice_physics.contacts(array<table> { b }, world), world)
+   assert(math.abs(b.vx - 200) < 0.000001, 'An outgoing contact must not receive a wall impulse')
+end
+
+@Test function FloorManifoldStopsEveryApproachingCorner()
+   local world = dice_physics.newWorld(72, 0, 2000, 1000)
+   local b = body(500, 928)
+   b.vy, b.wz = 1450 / 240, 0.29
+   local before = energy(b, world)
+   local contacts = dice_physics.contacts(array<table> { b }, world)
+   assert(#contacts is 4, 'A flat face needs four supporting vertices')
+   dice_physics.solve(contacts, world)
+   for _, point in dice_physics.geometry(b, world.radius).vertices do
+      if point.y >= 1000 - world.skin then
+         local vy = b.vy + b.wz * (point.x - b.x) - b.wx * point.z
+         assert(vy < 0.02, f'Contact still entering the floor: {vy}')
+      end
+   end
+   assert(energy(b, world) <= before * 1.000001, 'Floor contacts must be passive')
+end
+
+@Test function BothFloorTangentsResistSlip()
+   local world = dice_physics.newWorld(72, 0, 2000, 1000)
+   local b = body(500, 928)
+   b.vy, b.wx = 30, 0.3
+   dice_physics.solve(dice_physics.contacts(array<table> { b }, world), world)
+   assert(math.abs(b.wx) < 0.01, 'Depthwise contact slip must oppose rotation about X')
+end
+
+@Test function RestPreservesHeading()
+   local world = dice_physics.newWorld(72, 0, 2000, 1000)
+   local b = body(500, 928)
+   b.q = dice_physics.axisAngle(0, 1, 0, 40 * math.pi / 180)
+   local original = b.q
+   dice_physics.advance(array<table> { b }, world, 1)
+   assert(b.stopped, 'A supported, quiet cube should sleep')
+   local dot = original.w * b.q.w + original.x * b.q.x + original.y * b.q.y + original.z * b.q.z
+   assert(math.abs(dot) > 0.999999, 'Sleeping must preserve heading instead of snapping towards the camera')
+end
+
+@Test function StalePointerMotionIsDiscarded()
+   local samples = array<table> {
+      { x=0, y=0, time=0 }, { x=50, y=-25, time=0.05 }, { x=100, y=-50, time=0.1 }
+   }
+   local vx:num, vy:num = dice_physics.releaseVelocity(samples, 0.1)
+   assert(math.abs(vx - 1000) < 0.001 and math.abs(vy + 500) < 0.001, 'Use recent pointer velocity')
+   vx, vy = dice_physics.releaseVelocity(samples, 0.5)
+   assert(vx is 0 and vy is 0, 'Holding still before release must cancel the old throw')
+   vx, vy = dice_physics.releaseVelocity(array<table> { { x=10, y=10, time=0 } }, 0.01)
+   assert(vx is 0 and vy is 0, 'A stationary pointer must have zero measured velocity')
+end
+
+@Test function BriefPauseBeforeReleaseKeepsThrowSpeed()
+   local samples = array<table> { }
+   for i in {0 to 10} do samples.push({ x=i * 1000 / 60, y=0, time=i / 60 }) end
+   local last = samples[#samples - 1].time
+   for pause in values(array<double> { 0, 1 / 60, 0.05 }) do
+      local vx:num, vy:num = dice_physics.releaseVelocity(samples, last + pause)
+      assert(math.abs(vx - 1000) < 0.001 and vy is 0, f'Release after {pause}s must keep 1000px/s, got {vx}')
+   end
+end
+
+@Test function SeparationWakesDisplacedSleepers()
+   local world = dice_physics.newWorld(72, 0, 2000, 1000)
+   local a, b = body(800, 500), body(860, 500)
+   a.stopped, b.stopped = true, true
+   a.groundTime, b.groundTime = 2, 2
+   dice_physics.separate(array<table> { a, b }, world, 40)
+   assert(b.x - a.x > 60, 'Overlapping dice must be separated')
+   assert(not a.stopped and not b.stopped, 'A die moved by separation must not remain asleep')
+   assert(a.groundTime is 0 and b.groundTime is 0, 'Woken dice must restart their rest timers')
+end
+
+@Test function ElapsedTimePartitionDoesNotChangePhysics()
+   local first_world = dice_physics.newWorld(72, 0, 2000, 1000)
+   local second_world = dice_physics.newWorld(72, 0, 2000, 1000)
+   local a, b = body(500, 500), body(500, 500)
+   a.vx, b.vx, a.wz, b.wz = 100, 100, 3, 3
+   dice_physics.advance(array<table> { a }, first_world, 0.25)
+   for i in {0 to 15} do dice_physics.advance(array<table> { b }, second_world, 1 / 60) end
+   assert(math.abs(a.x - b.x) < 0.000001 and math.abs(a.y - b.y) < 0.000001,
+      'A delayed callback must retain elapsed time and produce the same fixed steps')
+   assert(math.abs(a.q.w - b.q.w) < 0.000001, 'Rotation must not depend on callback cadence')
+end
+
+@Test function DiceExchangeMomentumAndWake()
+   local world = dice_physics.newWorld(72, -2000, 2000, 2000)
+   world.gravity = 0
+   local a, b = body(-72, 0), body(72, 0)
+   a.vx = 200
+   b.stopped = true
+   local before = energy(a, world) + energy(b, world)
+   dice_physics.solve(dice_physics.contacts(array<table> { a, b }, world), world)
+   assert(not b.stopped, 'An impact must wake the struck die')
+   assert(b.vx > a.vx, 'Equal-mass cubes must exchange momentum and separate')
+   assert(math.abs(a.vx + b.vx - 200) < 0.001, 'Internal impulses must conserve in-plane momentum')
+   assert(energy(a, world) + energy(b, world) <= before * 1.000001, 'A pair collision must be passive')
+end
+
+@Test function GatheredDiceSeparateWithoutAnImpulse()
+   local world = dice_physics.newWorld(72, 0, 1920, 1080)
+   local bodies = array<table> { }
+   for i in {0 to 6} do
+      local b = body(850 + 20 * i, 700 + 5 * i)
+      b.q = dice_physics.axisAngle(1, 2, 3, 0.3 * i)
+      bodies.push(b)
+   end
+   dice_physics.separate(bodies, world, 80)
+   for i, a in bodies do
+      assert(energy(a, world) is 0, 'Initial separation must not manufacture velocity')
+      assert(lowest(a, world) <= world.bottom + world.skin, 'Separation must respect the floor')
+      for j in {i + 1 to #bodies} do
+         local b = bodies[j]
+         local hit = dice_physics.overlap(a, b, dice_physics.geometry(a, world.radius),
+            dice_physics.geometry(b, world.radius), world)
+         assert(not hit or hit.depth <= world.skin, 'Gathered cubes must be separated before release')
+      end
+   end
+end
+
+@Test function SmallFastDiceCannotCrossBetweenSteps()
+   local world = dice_physics.newWorld(0.72, -2000, 2000, 2000)
+   world.gravity = 0
+   local a, b = body(-3, 0), body(3, 0)
+   a.vx, b.vx = 1250, -1250
+   dice_physics.advance(array<table> { a, b }, world, 1 / 60)
+   assert(a.x < b.x and a.vx < 0 and b.vx > 0, 'Small fast cubes must collide instead of passing through')
+end
+
+@Test function DroppedCubeSettlesNaturally()
+   local world = dice_physics.newWorld(72, 0, 1920, 1080)
+   local b = body(700, 350)
+   b.q = dice_physics.axisAngle(1, 0.35, 0.2, 0.85)
+   b.vx, b.wx, b.wy, b.wz = 135, 2.7, -4.1, 3.2
+   dice_physics.advance(array<table> { b }, world, 12)
+   assert(b.stopped, 'A tumbling cube should settle without an orientation animation')
+   assert(math.abs(lowest(b, world) - world.bottom) < world.skin * 2, 'Resting cube must remain on the floor')
+end
+
+@Test function StackedDiceSleepAndWakeTogether()
+   local world = dice_physics.newWorld(72, 0, 1920, 1080)
+   local a, b = body(700, 1008), body(700, 864)
+   local bodies = array<table> { a, b }
+   dice_physics.advance(bodies, world, 3)
+   assert(a.stopped and b.stopped, 'A supported stack should sleep')
+   assert(math.abs(a.y - b.y - 144) < world.skin * 2, 'Stack must not collapse into itself')
+   local c = body(844, 864)
+   c.vx = -300
+   bodies.push(c)
+   dice_physics.advance(bodies, world, world.step)
+   assert(not a.stopped, 'An impact must wake supporting dice in the same physics step')
+   assert(not b.stopped, 'A sleeping stack must respond to another die')
+end
+
+@Test function SixDiceSettleWithoutOverlap()
+   local world = dice_physics.newWorld(72, 0, 1920, 1080)
+   local bodies = array<table> { }
+   for i in {0 to 6} do
+      local b = body(900 + 15 * i, 400 + 10 * i)
+      b.q = dice_physics.axisAngle(1, 0.35 + i * 0.08, 0.2, 0.85 + i * 0.17)
+      b.vx, b.vy, b.wx, b.wy, b.wz = 135 + i * 11, -60 - i * 8, 2.7, -4.1, 3.2
+      bodies.push(b)
+   end
+   dice_physics.separate(bodies, world, 80)
+   dice_physics.advance(bodies, world, 16)
+   for i, a in bodies do
+      assert(a.stopped, f'Die {i} did not settle: v={a.vx},{a.vy} w={a.wx},{a.wy},{a.wz} quiet={a.groundTime}')
+      assert(lowest(a, world) <= world.bottom + world.skin, 'Cube penetrated the floor')
+      for j in {i + 1 to #bodies} do
+         local b = bodies[j]
+         local hit = dice_physics.overlap(a, b, dice_physics.geometry(a, world.radius),
+            dice_physics.geometry(b, world.radius), world)
+         assert(not hit or hit.depth <= world.skin, 'Resting dice must not overlap')
+      end
+   end
+end
+
+@Test function RotatedImpactsRemainPassive()
+   local world = dice_physics.newWorld(72, -2000, 2000, 1000)
+   for i in {0 to 40} do
+      local b = body(0, 800)
+      b.q = dice_physics.axisAngle(1 + i % 3, 2, 3, i * 0.163)
+      b.y += world.bottom - lowest(b, world)
+      b.vx, b.vy = 300 - i * 15, 100 + i * 20
+      b.wx, b.wy, b.wz = 5 * math.sin(i), 7 * math.cos(i), 3
+      local before = energy(b, world)
+      dice_physics.solve(dice_physics.contacts(array<table> { b }, world), world)
+      assert(energy(b, world) <= before * 1.000001, f'Rotated floor impact {i} generated energy')
+   end
+end
+
+@Test function UnsupportedTiltTipsOntoAFace()
+   for axis in values(array<table> { { x=1, y=0, z=0 }, { x=1, y=0.2, z=0.3 } }) do
+      for angle in values(array<double> { -25, 25, 65 }) do
+         local world = dice_physics.newWorld(72, 0, 1920, 1080)
+         local b = body(700, 800)
+         b.q = dice_physics.axisAngle(axis.x, axis.y, axis.z, angle * math.pi / 180)
+         b.y += world.bottom - lowest(b, world)
+         dice_physics.advance(array<table> { b }, world, 8)
+         local alignment = 0
+         for _, face_axis in dice_physics.geometry(b, world.radius).axes do
+            alignment = math.max(alignment, math.abs(face_axis.y))
+         end
+         assert(alignment > 0.999,
+            f'An isolated die must tip onto a face rather than balance on an unsupported edge: angle={angle}')
+         assert(b.stopped, 'The die should sleep after reaching stable support')
+      end
+   end
+end
+
+@Test function ExactEdgeBalanceFallsOntoAFace()
+   for axis in values(array<table> { { x=1, y=0, z=0 }, { x=0, y=0, z=1 } }) do
+      for angle in values(array<double> { -45, 45 }) do
+         local world = dice_physics.newWorld(72, 0, 1920, 1080)
+         local b = body(700, 800)
+         b.q = dice_physics.axisAngle(axis.x, axis.y, axis.z, angle * math.pi / 180)
+         b.y += world.bottom - lowest(b, world)
+         dice_physics.advance(array<table> { b }, world, 10)
+         local alignment = 0
+         for _, face_axis in dice_physics.geometry(b, world.radius).axes do
+            alignment = math.max(alignment, math.abs(face_axis.y))
+         end
+         assert(alignment > 0.999 and b.stopped,
+            f'An exact edge balance must tip and settle on a face: angle={angle}, axisX={axis.x}')
+      end
+   end
+end
+
+@Test function ExactCornerBalanceFallsOntoAFace()
+   local world = dice_physics.newWorld(72, 0, 1920, 1080)
+   local b = body(700, 800)
+   b.q = dice_physics.axisAngle(1, 0, -1, -math.acos(1 / math.sqrt(3)))
+   b.y += world.bottom - lowest(b, world)
+   dice_physics.advance(array<table> { b }, world, 10)
+   local alignment = 0
+   for _, axis in dice_physics.geometry(b, world.radius).axes do
+      alignment = math.max(alignment, math.abs(axis.y))
+   end
+   assert(alignment > 0.999 and b.stopped, 'An exact corner balance must fall and settle on a face')
+end
+
+@Test function LoggedOffsetEdgeBalanceFallsOntoAFace()
+   for scale in values(array<double> { 0.5, 1, 3 }) do
+      local world = dice_physics.newWorld(72 * scale, 0, 4000 * scale, 1200 * scale)
+      local b = body(2000 * scale, 900 * scale)
+      -- Die 2 at frame 180 of the reported throw: almost motionless, with two offset support vertices.
+      b.q = { w=-0.317991, x=-0.121469, y=-0.880213, z=0.330685 }
+      b.vx, b.wx, b.wy, b.wz = 0.026 * scale, 0.0001, -0.0001, 0.0003
+      b.y += world.bottom - lowest(b, world)
+      dice_physics.advance(array<table> { b }, world, 10)
+      local alignment = 0
+      for _, axis in dice_physics.geometry(b, world.radius).axes do
+         alignment = math.max(alignment, math.abs(axis.y))
+      end
+      assert(alignment > 0.999 and b.stopped,
+         f'The logged offset edge balance must settle on a face: scale={scale}, alignment={alignment}')
+      assert(math.abs(lowest(b, world) - world.bottom) < world.skin * 2,
+         'Recovery must leave the resting die on the floor')
+   end
+end
+
+@Test function ThrowReplayPreservesPhysics()
+   local world = dice_physics.newWorld(36, -1920, 1920, 1200)
+   local bodies, dice = array<table> { }, array<table> { }
+   for i in {0 to 3} do
+      local b = body(100 + i * 100, 300 + i * 20)
+      b.q = dice_physics.axisAngle(1, 0.35, 0.2, 0.85 + i * 0.1)
+      b.vx, b.vy, b.wx, b.wy, b.wz = 123.45678901234567, -321.9876543210987, 2.7, -4.1, 3.2
+      b.balanceTime, b.roll, b.frame = 0, 9, 0
+      bodies.push(b)
+      dice.push({ state=b, theme={ name='blue' } })
+   end
+   local replay = dice_replay.decode(dice_replay.capture(dice, world, 0.5))
+   local restored = array<table> { }
+   for i, die in replay.dice do
+      assert(die.theme is 'blue' and die.state.roll is 9, 'Replay must preserve theme and roll number')
+      for _, key in array<str> { 'x', 'y', 'vx', 'vy', 'wx', 'wy', 'wz' } do
+         assert(die.state[key] is bodies[i][key], f'Replay lost precision in {key}')
+      end
+      restored.push(die.state)
+   end
+   dice_physics.advance(bodies, world, 2)
+   for i in {0 to 120} do dice_physics.advance(restored, replay.world, 1 / 60) end
+   for i, b in bodies do
+      for _, key in array<str> { 'x', 'y', 'vx', 'vy', 'wx', 'wy', 'wz', 'groundTime', 'balanceTime' } do
+         assert(b[key] is restored[i][key], f'Replayed trajectory differs in {key} for die {i}')
+      end
+      for _, key in array<str> { 'w', 'x', 'y', 'z' } do
+         assert(b.q[key] is restored[i].q[key], 'Replayed orientation differs')
+      end
+      assert(b.stopped is restored[i].stopped, 'Replayed sleep state differs')
+   end
+end
+
+@Test function InvalidThrowReplayIsRejected()
+   local b = body(500, 500)
+   local payload = dice_replay.capture(array<table> { { state=b, theme={ name='white' } } },
+      dice_physics.newWorld(72, 0, 1920, 1080), 1)
+   for invalid in values(array<str> {
+      '{}', payload .. ' trailing', payload.replace('"version":2', '"version":3'),
+      payload.replace('"scale":1', '"scale":0'), payload.replace('"step":', '"step":-'),
+      payload.replace('"vx":0', '"vx":"bad"'), payload.replace('"w":1', '"w":0')
+   }) do
+      local rejected = false
+      try
+         dice_replay.decode(invalid)
+      except
+         rejected = true
+      end
+      assert(rejected, f'Invalid replay was accepted: {invalid}')
+   end
+end
+
+@Test function SlowThrowSettlesPromptly()
+   local replay = dice_replay.decode([[
+{
+   "dice": [
+      {
+         "state": {
+            "wy": 1.5923973814703727,
+            "q": {
+               "x": -0.08181484247732822,
+               "y": -0.8343606472370386,
+               "z": -0.3345944093072125,
+               "w": -0.4303431458184938
+            },
+            "vy": -1250,
+            "wx": 0.018215728019657183,
+            "stopped": false,
+            "groundTime": 0,
+            "x": 2987.489062708827,
+            "y": 731.6611398831534,
+            "roll": 9,
+            "frame": 0,
+            "balanceTime": 0,
+            "wz": -0.5975584077714919,
+            "vx": -1250
+         },
+         "theme": "white"
+      },
+      {
+         "state": {
+            "wy": -1.6137346696431012,
+            "q": {
+               "x": 0.4726808362720291,
+               "y": -0.6694181051673486,
+               "z": -0.40797356321112455,
+               "w": 0.4025044089400146
+            },
+            "vy": -1250,
+            "wx": 0.18270336659834993,
+            "stopped": false,
+            "groundTime": 0,
+            "x": 3169.3168326864893,
+            "y": 745.776748490311,
+            "roll": 9,
+            "frame": 0,
+            "balanceTime": 0,
+            "wz": -0.7247235647940883,
+            "vx": -1232.668889302023
+         },
+         "theme": "purple"
+      },
+      {
+         "state": {
+            "wy": 0.2713091920475954,
+            "q": {
+               "x": 0.022776082108538435,
+               "y": 0.33236050492537234,
+               "z": 0.9427087974715089,
+               "w": -0.01782885356264443
+            },
+            "vy": -1237.269528008666,
+            "wx": 1.472366790985513,
+            "stopped": false,
+            "groundTime": 0,
+            "x": 3079.1141046046832,
+            "y": 738.0021116265356,
+            "roll": 9,
+            "frame": 0,
+            "balanceTime": 0,
+            "wz": 0.19401970371821695,
+            "vx": -1244.168796408868
+         },
+         "theme": "orange"
+      }
+   ],
+   "kind": "dice_throw",
+   "version": 1,
+   "scale": 0.5,
+   "world": {
+      "sleepSpeed": 1,
+      "gravity": 1450,
+      "bottom": 1200,
+      "step": 0.008333333333333333,
+      "left": 1920,
+      "right": 3840,
+      "skin": 0.18,
+      "inertia": 864,
+      "radius": 36,
+      "accumulator": 0
+   }
+}
+]])
+   local bodies = array<table> { }
+   for _, die in replay.dice do bodies.push(die.state) end
+   local elapsed = 0
+   while elapsed < 10 do
+      dice_physics.advance(bodies, replay.world, 1 / 60)
+      elapsed += 1 / 60
+      local stopped = true
+      for _, b in bodies do
+         if not b.stopped then stopped = false end
+      end
+      if stopped then break end
+   end
+   print(f'Recorded throw settled after {elapsed} seconds')
+   assert(elapsed < 6, 'An isolated floor balance must not creep for several seconds before settling')
+   for _, b in bodies do
+      assert(b.stopped, 'Every die in the recorded throw must sleep')
+      assert(math.abs(lowest(b, replay.world) - replay.world.bottom) < replay.world.skin * 2,
+         'Recovery must preserve floor contact')
+   end
+end
+
+@Test function CollisionNotificationsIgnoreRestingContacts()
+   local world = dice_physics.newWorld(72, 0, 1920, 1080)
+   local surface, dice = 0, 0
+   world.onImpact = function(Surface:bool!, Speed:num!)
+      assert(Speed >= 40, 'Only appreciable approaching impacts should be reported')
+      if Surface then surface++ else dice++ end
+   end
+   local b = body(700, 1008)
+   dice_physics.advance(array<table> { b }, world, 1)
+   assert(surface is 0 and dice is 0, 'Resting floor support must be silent')
+   b.stopped, b.vy = false, 300
+   dice_physics.advance(array<table> { b }, world, world.step)
+   assert(surface > 0 and dice is 0, 'Floor impact must select the dense sample')
+   surface = 0
+   local a, c = body(700, 500), body(844, 500)
+   a.vx = 300
+   dice_physics.advance(array<table> { a, c }, world, world.step)
+   assert(dice > 0 and surface is 0, 'Die-to-die impacts must select the click sample')
+   dice = 0
+   local wall = body(72, 500)
+   wall.vx = -300
+   dice_physics.advance(array<table> { wall }, world, world.step)
+   assert(surface > 0 and dice is 0, 'Wall impacts must select the same dense sample as the floor')
+end
+
+@Test function PolyhedralMeshesAreClosedAndConvex()
+   for _, sides in array<int> { 4, 6, 8, 10, 12, 20 } do
+      local shape = dice_shapes.get(sides)
+      assert(#shape.faces is sides, f'D{sides} must have exactly {sides} faces')
+      assert(#shape.vertices - #shape.edges + #shape.faces is 2, 'A convex mesh must satisfy Euler topology')
+      local values_seen = { }
+      for _, face in shape.faces do
+         assert(face.area > 0, 'Face winding must point outwards')
+         assert(not values_seen[face.value], 'Face values must be unique')
+         values_seen[face.value] = true
+         local plane = face.normal.x * face.centre.x + face.normal.y * face.centre.y +
+            face.normal.z * face.centre.z
+         for _, vertex in shape.vertices do
+            local distance = face.normal.x * vertex.x + face.normal.y * vertex.y + face.normal.z * vertex.z
+            assert(distance <= plane + 0.000001, 'Every face must bound the complete convex mesh')
+         end
+         for _, index in face.indices do
+            local vertex = shape.vertices[index]
+            local distance = face.normal.x * vertex.x + face.normal.y * vertex.y + face.normal.z * vertex.z
+            assert(math.abs(distance - plane) < 0.000001, 'Face vertices must be coplanar')
+         end
+      end
+   end
+end
+
+@Test function WinnersMatchProjectedPolygonAreas()
+   for _, sides in array<int> { 4, 6, 8, 10, 12, 20 } do
+      local shape = dice_shapes.get(sides)
+      for i in {0 to 25} do
+         local q = dice_physics.axisAngle(1, 0.3 + i, 0.7, i * 0.371)
+         local winner, best = 0, 0
+         for _, face in shape.faces do
+            local area = 0
+            for j, index in face.indices do
+               local a = dice_physics.rotatePoint(q, shape.vertices[index])
+               local b = dice_physics.rotatePoint(q, shape.vertices[face.indices[(j + 1) % #face.indices]])
+               area += (a.x * b.y - a.y * b.x) * 0.5
+            end
+            if area > best + 0.00000001 then winner, best = face.value, area end
+         end
+         local value, area = dice_shapes.winner(shape, q)
+         assert(math.abs(area - best) < 0.000001, 'Winning area must match the projected polygon')
+         -- Symmetric poses may differ only by floating-point roundoff at an exact tie.
+         if value != winner then
+            local matching = false
+            for _, face in shape.faces do
+               if face.value is value then
+                  local n = dice_physics.rotatePoint(q, face.normal)
+                  matching = math.abs(face.area * n.z - best) < 0.000001
+               end
+            end
+            assert(matching, 'Only a largest visible face may win')
+         end
+      end
+   end
+   local q = { w=1, x=0, y=0, z=0 }
+   local unequal = { faces=array<table> {
+      { value=1, area=1, normal={ x=0, y=0, z=1 } },
+      { value=2, area=3, normal={ x=0.8, y=0, z=0.6 } },
+      { value=3, area=100, normal={ x=0, y=0, z=-1 } }
+   } }
+   assert(dice_shapes.winner(unequal, q) is 2, 'Use projected area, not just normal alignment or rear area')
+end
+
+@Test function PolyhedralThrowsSettleOnTheFloor()
+   for _, sides in array<int> { 4, 8, 10, 12, 20 } do
+      for pose in {0 to 3} do
+         local world = dice_physics.newWorld(72, 0, 2000, 1000)
+         local b = body(600, 500)
+         b.shape = dice_shapes.get(sides)
+         b.q = dice_physics.axisAngle(1, 0.7, 0.3, 0.3 + pose * 0.6)
+         b.vx, b.vy, b.wx, b.wy, b.wz = 110, -60, 2.7, -4.1, 3.2
+         for frame in {0 to 1200} do
+            dice_physics.advance(array<table> { b }, world, 1 / 60)
+            if b.stopped then break end
+         end
+         assert(b.stopped, f'D{sides} pose {pose} must settle within twenty seconds')
+         assert(math.abs(lowest(b, world) - world.bottom) < world.skin * 2,
+            f'D{sides} must rest on the floor without penetration')
+      end
+   end
+end
+
+@Test function MixedPolyhedraCollideAndSeparate()
+   for _, sides in array<int> { 4, 6, 8, 10, 12, 20 } do
+      local world = dice_physics.newWorld(72, 0, 2000, 1000)
+      local a, b = body(700, 500), body(820, 500)
+      a.shape, b.shape = dice_shapes.get(sides), dice_shapes.get(20)
+      a.q = dice_physics.axisAngle(1, 0.4, 0.7, 0.73)
+      b.q = dice_physics.axisAngle(0.3, 1, 0.5, 0.41)
+      a.vx, b.vx = 200, -200
+      local before = energy(a, world) + energy(b, world)
+      local contacts = dice_physics.contacts(array<table> { a, b }, world)
+      assert(#contacts > 0, f'D{sides} and D20 must produce collision contacts')
+      dice_physics.solve(contacts, world)
+      assert(energy(a, world) + energy(b, world) <= before * 1.000001, 'Mixed collisions must be passive')
+      assert(a.vx < 200 and b.vx > -200, 'Mixed contacts must oppose approach')
+      dice_physics.separate(array<table> { a, b }, world, 40)
+      local hit = dice_physics.overlap(a, b, dice_physics.geometry(a, world.radius),
+         dice_physics.geometry(b, world.radius), world)
+      assert(not hit or hit.depth <= world.skin, 'Mixed shapes must separate')
+   end
+end
+
+@Test function MixedShapeReplayPreservesTypesAndMotion()
+   local world = dice_physics.newWorld(72, 0, 2000, 1000)
+   local dice, original = array<table> { }, array<table> { }
+   for i, sides in array<int> { 4, 6, 8, 10, 12, 20 } do
+      local b = body(200 + i * 280, 400)
+      b.shape = dice_shapes.get(sides)
+      b.wx, b.vx = 2, 70
+      original.push(b)
+      dice.push({ state=b, theme={ name='white' } })
+   end
+   local replay = dice_replay.decode(dice_replay.capture(dice, world, 1))
+   local restored = array<table> { }
+   for i, die in replay.dice do
+      assert(die.state.shape.sides is original[i].shape.sides, 'Replay must preserve each shape')
+      restored.push(die.state)
+   end
+   dice_physics.advance(original, world, 0.2)
+   dice_physics.advance(restored, replay.world, 0.2)
+   for i, b in original do
+      assert(math.abs(b.x - restored[i].x) < 0.000001 and math.abs(b.q.w - restored[i].q.w) < 0.000001,
+         'Mixed replay must reproduce motion')
+   end
+   local payload = dice_replay.capture(array<table> { dice[0] }, dice_physics.newWorld(72, 0, 2000, 1000), 1)
+   local legacy = dice_replay.decode(payload.replace('"version":2', '"version":1'))
+   assert(legacy.dice[0].state.shape.sides is 6, 'Version one replays must always load as D6')
+   local rejected = false
+   try
+      dice_replay.decode(payload.replace('"sides":4', '"sides":7'))
+   except
+      rejected = true
+   end
+   assert(rejected, 'Unsupported replay shapes must be rejected')
+end
+
+@Test function MixedSetSettlesWithoutOverlap()
+   local world = dice_physics.newWorld(72, 0, 1920, 1080)
+   local bodies = array<table> { }
+   for i, sides in array<int> { 4, 6, 8, 10, 12, 20 } do
+      local b = body(900 + 15 * i, 400 + 10 * i)
+      b.shape = dice_shapes.get(sides)
+      b.q = dice_physics.axisAngle(1, 0.35 + i * 0.08, 0.2, 0.85 + i * 0.17)
+      b.vx, b.vy, b.wx, b.wy, b.wz = 135 + i * 11, -60 - i * 8, 2.7, -4.1, 3.2
+      bodies.push(b)
+   end
+   dice_physics.separate(bodies, world, 80)
+   dice_physics.advance(bodies, world, 20)
+   for i, a in bodies do
+      assert(a.stopped, f'D{a.shape.sides} must settle in a mixed group')
+      assert(lowest(a, world) <= world.bottom + world.skin, 'Mixed dice must stay above the floor')
+      for j in {i + 1 to #bodies} do
+         local b = bodies[j]
+         local hit = dice_physics.overlap(a, b, dice_physics.geometry(a, world.radius),
+            dice_physics.geometry(b, world.radius), world)
+         assert(not hit or hit.depth <= world.skin, 'Mixed resting dice must not overlap')
+      end
+   end
+end
+
+@Test function TetrahedronContactsUseActualFaces()
+   local world = dice_physics.newWorld(72, 0, 2000, 1000)
+   for i in {0 to 40} do
+      local a, b = body(700, 500), body(850, 510)
+      a.shape, b.shape = dice_shapes.get(4), dice_shapes.get(20)
+      a.q = dice_physics.axisAngle(1, 0.4, 0.7, i * 0.173)
+      b.q = dice_physics.axisAngle(0.3, 1, 0.5, i * 0.219)
+      local ga, gb = dice_physics.geometry(a, world.radius), dice_physics.geometry(b, world.radius)
+      local hit = dice_physics.overlap(a, b, ga, gb, world)
+      if not hit then continue end
+      if hit.kind != 2 then
+         local normal = hit.kind is 0 ? ga.normals[hit.i] : gb.normals[hit.i]
+         local alignment = normal.x * hit.n.x + normal.y * hit.n.y + normal.z * hit.n.z
+         assert(math.abs(alignment - (hit.kind is 0 ? -1 : 1)) < 0.000001,
+            'A face contact must refer to a real outward face, not an imaginary opposite D4 face')
+      end
+      assert(#dice_physics.contacts(array<table> { a, b }, world) > 0, 'Overlapping dice need a contact manifold')
+   end
+end
+
+@Test function LargeDiceSphereContactsAreOrientationIndependentAndPassive()
+   for _, pair in array<array<int>> { array<int> { 12, 12 }, array<int> { 12, 20 }, array<int> { 20, 20 } } do
+      local world = dice_physics.newWorld(72, 0, 2000, 1000)
+      world.collisions = 'sphere'
+      local diameter = (dice_shapes.get(pair[0]).faces[0].distance +
+         dice_shapes.get(pair[1]).faces[0].distance) * world.radius
+      local a, b = body(700, 500), body(700 + diameter - 10, 500)
+      a.shape, b.shape = dice_shapes.get(pair[0]), dice_shapes.get(pair[1])
+      a.q = dice_physics.axisAngle(1, 0.4, 0.7, 0.73)
+      b.q = dice_physics.axisAngle(0.3, 1, 0.5, 0.41)
+      local hit = dice_physics.overlap(a, b, dice_physics.geometry(a, world.radius),
+         dice_physics.geometry(b, world.radius), world)
+      assert(hit.sphere and math.abs(hit.depth - 10) < 0.000001 and hit.n.x is -1,
+         'D12 and larger pairs must use their inscribed spheres, regardless of orientation')
+      a.vx, b.vx = 200, -200
+      local before = energy(a, world) + energy(b, world)
+      local contacts = dice_physics.contacts(array<table> { a, b }, world)
+      assert(#contacts is 1, 'A sphere pair needs one contact')
+      dice_physics.solve(contacts, world)
+      assert(a.vx < 0 and b.vx > 0, 'Approaching spheres must bounce apart')
+      assert(math.abs(a.vx + b.vx) < 0.000001, 'Sphere impulses must conserve linear momentum')
+      assert(energy(a, world) + energy(b, world) <= before * 1.000001, 'Sphere collisions must remain passive')
+      assert(a.wx is 0 and a.wy is 0 and a.wz is 0 and b.wx is 0 and b.wy is 0 and b.wz is 0,
+         'A central normal impulse must not introduce spin')
+      b.x = a.x + diameter + world.skin * 2
+      assert(not dice_physics.overlap(a, b, dice_physics.geometry(a, world.radius),
+         dice_physics.geometry(b, world.radius), world), 'Separated spheres must not collide')
+   end
+end
+
+@Test function CoincidentD20SpheresSeparateWithoutInvalidNormals()
+   local world = dice_physics.newWorld(72, 0, 2000, 1000)
+   world.collisions = 'sphere'
+   local a, b = body(800, 500), body(800, 500)
+   a.shape, b.shape = dice_shapes.get(20), dice_shapes.get(20)
+   dice_physics.separate(array<table> { a, b }, world, 3)
+   local distance = math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2)
+   assert(math.abs(distance - 2 * a.shape.faces[0].distance * world.radius) <= world.skin,
+      'Coincident centres must separate deterministically to the inscribed diameter')
+end
+
+@Test function SphereModePreservesOtherShapesAndEnvironmentContacts()
+   local world = dice_physics.newWorld(72, 0, 2000, 1000)
+   for _, sides in array<int> { 4, 6, 8, 10 } do
+      local a, b = body(700, 500), body(820, 500)
+      a.shape, b.shape = dice_shapes.get(sides), dice_shapes.get(20)
+      local ga, gb = dice_physics.geometry(a, world.radius), dice_physics.geometry(b, world.radius)
+      world.collisions = 'polyhedron'
+      local original = dice_physics.overlap(a, b, ga, gb, world)
+      world.collisions = 'sphere'
+      local actual = dice_physics.overlap(a, b, ga, gb, world)
+      assert(original and actual and not actual.sphere and actual.depth is original.depth,
+         'Mixed D20 pairs must retain exact convex collision detection')
+   end
+   local b = body(90, 940)
+   b.shape = dice_shapes.get(20)
+   b.q = dice_physics.axisAngle(1, 0.4, 0.7, 0.73)
+   world.collisions = 'polyhedron'
+   local original = dice_physics.contacts(array<table> { b }, world)
+   world.collisions = 'sphere'
+   local actual = dice_physics.contacts(array<table> { b }, world)
+   assert(#original > 0 and #actual is #original, 'Floor and wall contacts must retain the D20 geometry')
+   for i, contact in actual do
+      assert(contact.ra.x is original[i].ra.x and contact.ra.y is original[i].ra.y and
+         contact.ra.z is original[i].ra.z and contact.n.x is original[i].n.x and contact.n.y is original[i].n.y,
+         'Environment contact points and normals must remain exact')
+   end
+end
+
+@Test function SphereCollisionReplayPreservesModeAndRejectsInvalidModes()
+   local world = dice_physics.newWorld(72, 0, 2000, 1000)
+   local b = body(500, 500)
+   b.shape = dice_shapes.get(20)
+   local dice = array<table> { { state=b, theme={ name='white' } } }
+   local legacy = dice_replay.decode(dice_replay.capture(dice, world, 1))
+   assert(legacy.version is 2 and legacy.world.collisions is 'polyhedron',
+      'Existing throws must retain exact collision behaviour')
+   world.collisions = 'sphere'
+   local payload = dice_replay.capture(dice, world, 1)
+   local replay = dice_replay.decode(payload)
+   local old = dice_replay.decode(payload.replace('"version":4', '"version":3')
+      .replace('"collisions"', '"d20Collisions"'))
+   assert(old.world.collisions is 'sphere', 'Legacy D20 sphere replays must remain readable')
+   assert(replay.version is 4 and replay.world.collisions is 'sphere',
+      'Sphere throws must preserve the approximation through worker and replay transport')
+   local rejected = false
+   try
+      dice_replay.decode(payload.replace('"sphere"', '"unknown"'))
+   except
+      rejected = true
+   end
+   assert(rejected, 'Invalid replay collision modes must be rejected')
+end
+
+@Test function MixedSphereGroupSettlesOnTheGeometricFloor()
+   local world = dice_physics.newWorld(72, 0, 1920, 1080)
+   world.collisions = 'sphere'
+   local bodies = array<table> { }
+   for i in {0 to 4} do
+      local b = body(700 + i * 80, 350 + i * 10)
+      b.shape = dice_shapes.get(i % 2 is 0 ? 12 : 20)
+      b.q = dice_physics.axisAngle(1, 0.35, 0.2, 0.85 + i * 0.17)
+      b.vx, b.vy, b.wx, b.wy, b.wz = 135, -60, 2.7, -4.1, 3.2
+      bodies.push(b)
+   end
+   dice_physics.separate(bodies, world, 80)
+   dice_physics.advance(bodies, world, 15)
+   for i, a in bodies do
+      assert(a.stopped, 'Sphere-approximated dice must still settle')
+      assert(lowest(a, world) <= world.bottom + world.skin, 'The actual vertices must stay above the floor')
+      for j in {i + 1 to #bodies} do
+         local b = bodies[j]
+         local distance = math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2)
+         assert(distance >= (a.shape.faces[0].distance + b.shape.faces[0].distance) * world.radius - world.skin,
+            'Resting inscribed spheres must not overlap')
+      end
+   end
+end
+
+@Test function CachedSeparationMatchesFreshGeometry()
+   for _, mode in array<str> { 'polyhedron', 'sphere' } do
+      for _, sides in array<int> { 6, 12, 20 } do
+         local world = dice_physics.newWorld(72, 0, 1920, 1080)
+         world.collisions = mode
+         local cached, fresh = array<table> { }, array<table> { }
+         for i in {0 to 2} do
+            local a, b = body(80 + i * 100, 1030 - i * 20), body(80 + i * 100, 1030 - i * 20)
+            a.shape, b.shape = dice_shapes.get(sides), dice_shapes.get(sides)
+            a.q = dice_physics.axisAngle(1, 0.4, 0.7, 0.73 + i * 0.41)
+            b.q = a.q
+            cached.push(a)
+            fresh.push(b)
+         end
+         local _, shapes = dice_physics.contacts(cached, world)
+         dice_physics.separate(cached, world, 40, shapes)
+         -- Rebuild geometry between each pass as the original implementation did.
+         for _ in {0 to 40} do dice_physics.separate(fresh, world, 1) end
+         for i, a in cached do
+            assert(math.abs(a.x - fresh[i].x) < 0.000001 and math.abs(a.y - fresh[i].y) < 0.000001,
+               'Reusing geometry must preserve wall, floor and pair corrections')
+            local rebuilt = dice_physics.geometry(a, world.radius)
+            for j, point in shapes[i].vertices do
+               local actual = rebuilt.vertices[j]
+               assert(math.abs(point.x - actual.x) < 0.000001 and math.abs(point.y - actual.y) < 0.000001 and
+                  math.abs(point.z - actual.z) < 0.000001, 'Cached vertices must track every positional correction')
+            end
+         end
+      end
+   end
+end
+
+@Test function LoadedFloorDieResistsCreep()
+   for angle in values(array<double> { 0, 0.08, 0.2 }) do
+      local world = dice_physics.newWorld(72, 0, 1920, 1080)
+      local base, top = body(700, 1008), body(735, 800)
+      top.q = dice_physics.axisAngle(0, 0, 1, angle)
+      top.y += 936 - lowest(top, world)
+      local bodies = array<table> { base, top }
+      dice_physics.advance(bodies, world, 5)
+      assert(math.abs(base.x - 700) < 1, 'A loaded flat floor die must resist lateral creep')
+      assert(base.stopped and top.stopped, 'A quiet supported stack must settle')
+   end
+end
+
+@Test function StaticFrictionHoldsLoadedDieUnderWeakForce()
+   local world = dice_physics.newWorld(72, 0, 1920, 1080)
+   local base, top = body(700, 1008), body(735, 864)
+   local bodies = array<table> { base, top }
+   for _ in {0 to 360} do
+      -- A small sustained horizontal force remains below the floor's static friction limit.
+      base.stopped, top.stopped = false, false
+      base.groundTime, top.groundTime = 0, 0
+      base.vx += 120 * world.step
+      dice_physics.advance(bodies, world, world.step)
+   end
+   assert(math.abs(base.x - 700) < world.skin, 'Sub-threshold force must not slide a loaded die across the floor')
+   assert(math.abs(top.x - 735) < world.skin, 'Static contact friction must also hold the upper die')
+end
+
+@Test function RecordedD6StacksSettleWithoutSliding()
+   local replay = dice_replay.decode(io.readAll('sdk:projects/upchuck/tests/fixtures/stacked_d6_throw.json'))
+   local bodies = array<table> { }
+   for _, die in replay.dice do bodies.push(die.state) end
+   local elapsed = 0
+   for frame in {0 to 360} do
+      dice_physics.advance(bodies, replay.world, 1 / 60)
+      elapsed = (frame + 1) / 60
+      local moving = false
+      for _, b in bodies do if not b.stopped then moving = true end end
+      if not moving then break end
+   end
+   for _, b in bodies do
+      assert(b.stopped, 'Every die in the recorded stacks must settle within six seconds')
+   end
+   print(f'Recorded stacks settled after {elapsed} seconds')
+end
+
+@Test function NearlyFlatStackRetainsFaceSupport()
+   local world = dice_physics.newWorld(72, 1920, 3840, 1200)
+   local base, top = body(3394.31, 1127.89), body(3405.07, 983.87)
+   -- Poses from frame 150 of the reported throw: opposing faces differ by only a tiny tilt.
+   base.q = { w=0.000909, x=-0.967653, y=-0.000152, z=-0.252283 }
+   top.q = { w=-0.000435, x=0.887607, y=0.000172, z=0.460601 }
+   for _, b in array<table> { base, top } do
+      local q = b.q
+      local length = math.sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z)
+      q.w, q.x, q.y, q.z = q.w / length, q.x / length, q.y / length, q.z / length
+   end
+   local bodies = array<table> { base, top }
+   local pair_contacts = 0
+   for _, c in dice_physics.contacts(bodies, world) do
+      if c.b then pair_contacts++ end
+   end
+   assert(pair_contacts >= 3, 'Nearly parallel stacked faces need an area of support, not a single edge point')
+   dice_physics.advance(bodies, world, 2)
+   assert(base.stopped and top.stopped, 'A nearly flat stack must settle promptly')
+   assert(math.abs(top.x - 3405.07) < world.skin, 'A quiet upper die must not creep across its support')
+end

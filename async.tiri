@@ -1,0 +1,101 @@
+-- Main-thread endpoint: one command writer, one snapshot writer, and generation numbers to reject old throws.
+
+   import 'json'
+   namespace dice_async { }
+
+dice_async.new = function(Path:str!, Initial:str!):table
+   worker      = obj<Tiri> { path=Path }
+   prefix      = f'dice_{worker.id}_'
+   generation  = 0
+   sequence    = 0
+   closed      = false
+   closing     = false
+   completed   = false
+   last_impact = 0
+   last_snapshot:str
+   failure:str
+
+   function command(Throw:str, Paused:bool!, Measure:bool)
+      generation++
+      async.pool[prefix .. 'command'] = json.encode({
+         generation=generation, throw=Throw, paused=Paused, measure=Measure
+      })
+   end
+
+   function verify()
+      if failure then raise failure end
+      if closed or closing then raise 'Dice physics worker is closed.' end
+      if completed and not closed then raise 'Dice physics worker stopped unexpectedly.' end
+   end
+
+   worker.setKey('pool', prefix)
+   command(Initial, false)
+   async.script(worker, function(Script:obj!)
+      completed = true
+      if Script.error != ERR_Okay then
+         failure = 'Dice physics worker: ' .. Script.errorMessage
+      end
+   end)
+
+   return {
+      reset = function(Throw:str!, Measure:bool)
+         verify()
+         command(Throw, false, Measure)
+      end,
+      pause = function()
+         verify()
+         command(nil, true)
+      end,
+      read = function():table
+         verify()
+
+         encoded:str = async.pool[prefix .. 'snapshot']
+         if not encoded or encoded is last_snapshot then return nil end
+         last_snapshot = encoded
+
+         snapshot = json.decode(encoded)
+         if snapshot.generation != generation or snapshot.sequence <= sequence then return nil end
+         sequence = snapshot.sequence
+         fresh = array<table> { }
+
+         for _, impact in snapshot.impacts do
+            if impact.id > last_impact then
+               last_impact = impact.id
+               if mSys.PreciseTime() - impact.time <= 250000 then fresh.push(impact) end
+            end
+         end
+
+         snapshot.impacts = fresh
+         async.pool[prefix .. 'ack'] = last_impact
+         return snapshot
+      end,
+      close = function():table
+         if closed or closing then return nil end
+         closing = true
+         async.pool[prefix .. 'stop'] = true
+
+         -- Join before releasing the script or pool keys.  Completion callbacks run during this wait.
+
+         deadline = mSys.PreciseTime() + 5000000
+         while not completed and mSys.PreciseTime() < deadline do
+            err = async.wait(worker, 0.1)
+            if err != ERR_Okay and err != ERR_Timeout and err != ERR_Terminate then check err end
+         end
+
+         if not completed then
+            closing = false
+            raise 'Timed out stopping the dice physics worker.'
+         end
+
+         closed = true
+         metrics:str = async.pool[prefix .. 'metrics']
+         for _, suffix in array<str> { 'command', 'snapshot', 'stop', 'ack', 'metrics' } do
+            async.pool[prefix .. suffix] = nil
+         end
+
+         worker = nil
+         if failure then raise failure end
+         return metrics ? json.decode(metrics) : nil
+      end
+   }
+end

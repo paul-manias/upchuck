@@ -1,0 +1,201 @@
+   import '../dice_render'
+   import '../dice_physics'
+   import '../dice_shapes'
+
+function pixels(Bitmap:obj!):array<byte>
+   local data = array<byte, (Bitmap.height * Bitmap.lineWidth)>
+   check Bitmap.acSeek(0, SEEK_START)
+   local _, count = check Bitmap.acRead(data)
+   assert(count is #data, 'Expected the complete bitmap')
+   return data
+end
+
+function newScene():table
+   local surface = obj<Surface> { width=96, height=96, flags='Composite' }
+   local scene = surface.new('VectorScene', { surface=surface })
+   local root = scene.new('VectorViewport', { width=96, height=96 })
+   local renderer = dice_render.new(scene, surface)
+   check surface.acShow()
+   return { surface=surface, scene=scene, root=root, renderer=renderer, bitmap=surface.buffer }
+end
+
+function finish(Renderer:table!)
+   check async.wait(Renderer.scene, 5)
+   assert(not Renderer.busy, 'The draw callback did not complete')
+   assert(not Renderer.failure, Renderer.failure ?? 'Draw failed')
+end
+
+@Test function ParallelDrawsMatchSynchronousPixels()
+   local scenes = array<table> { }
+   defer for _, item in scenes do item.renderer.close() end end
+   for i in {0 to 4} do
+      local item = newScene()
+      scenes.push(item)
+      item.root.new('VectorEllipse', { cx=48, cy=48, radius=30 + i, fill='#a03070a0' })
+      item.root.new('VectorText', { x=30, y=55, string=tostring(i + 12), fontSize='20px', fill='white' })
+      assert(item.renderer.submit())
+      assert(not item.renderer.submit(), 'A busy die queued another draw')
+   end
+   for _, item in scenes do
+      finish(item.renderer)
+      local expected = pixels(item.bitmap)
+      item.scene.flags = item.scene.flags & ~VPF_MANUAL_RENDER
+      check item.bitmap.mtDrawRectangle(0, 0, 96, 96, 0, BAF_FILL)
+      check item.scene.acDraw()
+      assert(expected is pixels(item.bitmap), 'Threaded pixels differ from synchronous pixels')
+      assert(item.renderer.completed is 1, 'Only one asynchronous draw should complete')
+      assert(item.scene.bitmap.id is item.surface.buffer.id, 'Scene must draw directly into the surface buffer')
+   end
+end
+
+@Test function ScheduledRedrawPreservesManualFrame()
+   local item = newScene()
+   defer item.renderer.close() end
+   item.root.new('VectorRectangle', { x=10, y=10, width=60, height=60, fill='#80b0e080' })
+   local callbacks = 0
+   item.surface.mtAddCallback(function() callbacks++ end)
+   item.surface.acShow()
+   item.renderer.submit()
+   finish(item.renderer)
+   local expected = pixels(item.bitmap)
+   check item.surface.acDraw()
+   check item.surface.mtScheduleRedraw()
+   processing.sleep(0.1)
+   assert(expected is pixels(item.bitmap), 'Automatic redraw erased the manually rendered frame')
+   assert(callbacks is 0, 'Manual surface redraw must not invoke automatic drawing callbacks')
+   item.surface.flags = item.surface.flags & ~RNF_MANUAL_RENDER
+   item.scene.flags = item.scene.flags & ~VPF_MANUAL_RENDER
+   check item.surface.acDraw()
+   assert(callbacks > 0, 'Normal redraw must resume when manual rendering is disabled')
+end
+
+@Test function DirectDrawClearsPreviousPose()
+   local item = newScene()
+   defer item.renderer.close() end
+   local shape = item.root.new('VectorRectangle', { x=0, y=0, width=40, height=40, fill='red' })
+   item.renderer.submit()
+   finish(item.renderer)
+   shape.visibility = VIS_HIDDEN
+   item.renderer.submit()
+   finish(item.renderer)
+   local data = pixels(item.bitmap)
+   assert(data is array<byte, #data>, 'Old pixels remain after a shape disappears')
+end
+
+@Test function CloseDrainsPendingDraw()
+   local item = newScene()
+   item.root.new('VectorEllipse', { cx=32, cy=32, radius=20, fill='blue' })
+   item.renderer.submit()
+   item.renderer.close()
+   assert(not item.renderer.busy and item.renderer.completed is 1, 'Close must drain the outstanding draw')
+   assert(not item.renderer.failure, 'Pending draw failed at shutdown')
+   item.renderer.close()
+   local rejected = false
+   try
+      item.renderer.submit()
+   except e
+      rejected = true
+   end
+   assert(rejected, 'Closed renderer accepted a new draw')
+end
+
+@Test function ManualDrawDefersResizeCallbacksUntilFlush()
+   local item = newScene()
+   defer item.renderer.close() end
+   local shape = item.root.new('VectorRectangle', { width='100%', height='100%', fill='green' })
+   local calls = 0
+   shape.resizeEvent = function()
+      assert(mSys.GetResource(RES_MAIN_THREAD) != 0, 'Resize callback ran outside the main thread')
+      calls++
+   end
+   local draw_error = ERR_Okay
+   async.action(item.scene, 'Draw', function(ActionID, Object, Error) draw_error = Error end, 0)
+   check async.wait(item.scene, 5)
+   assert(draw_error is ERR_Okay and calls is 0, 'Worker drawing dispatched a resize callback')
+   check item.scene.acFlush()
+   assert(calls > 0, 'Flush did not dispatch the pending resize callback')
+   async.action(item.scene, 'Flush', function(ActionID, Object, Error) draw_error = Error end, 0)
+   check async.wait(item.scene, 5)
+   assert(draw_error is ERR_OutsideMainThread, 'Flush must reject worker-thread dispatch')
+end
+
+@Test function FaceOnCubeHullHasFourDistinctCorners()
+   local shape = dice_shapes.get(6)
+   for heading in {0 to 8} do
+      for _, tilt in array<double> { 0, 0.00000001, -0.00000001, 0.000001, -0.000001 } do
+         local q = dice_physics.quatMultiply(dice_physics.axisAngle(0, 0, 1, heading * math.pi / 4),
+            dice_physics.quatMultiply(dice_physics.axisAngle(0, 1, 0, math.pi / 2 + tilt),
+               dice_physics.axisAngle(1, 0, 0, tilt)))
+         local points = array<table> { }
+         for _, vertex in shape.vertices do
+            local point = dice_physics.rotatePoint(q, vertex)
+            points.push({ x=48 + point.x * 28, y=48 + point.y * 28 })
+         end
+         local hull = dice_render.convexHull(points)
+         assert(#hull is 4, f'Face-on cube has extra projected corners: heading={heading}, tilt={tilt}')
+         for i, point in hull do
+            local next_point = hull[(i + 1) % #hull]
+            local dx, dy = next_point.x - point.x, next_point.y - point.y
+            assert(math.sqrt(dx * dx + dy * dy) > 55.99, 'Tiny hull edges must not collapse corner rounding')
+         end
+      end
+   end
+end
+
+@Test function FaceOnCubeMaskRoundsEveryCorner()
+   local item = newScene()
+   defer item.renderer.close() end
+   local clip = item.scene.new('VectorClip', { units='UserSpace' })
+   local outline = clip.viewport.new('VectorPath', { sequence='M 0,0 L 96,0 L 96,96 L 0,96 Z' })
+   local group = item.root.new('VectorGroup', { mask=clip })
+   group.new('VectorRectangle', { width=96, height=96, fill='#9050b0a0' })
+   for _, heading in array<double> { 0, math.pi / 4 } do
+      local expected = array<table> { }
+      for _, vertex in array<table> {
+         { x=-1, y=-1 }, { x=1, y=-1 }, { x=1, y=1 }, { x=-1, y=1 }
+      } do
+         expected.push({ x=48 + 28 * (vertex.x * math.cos(heading) - vertex.y * math.sin(heading)),
+            y=48 + 28 * (vertex.x * math.sin(heading) + vertex.y * math.cos(heading)) })
+      end
+      outline.sequence = dice_render.roundedHullSequence(expected, 7)
+      item.renderer.submit()
+      finish(item.renderer)
+      local reference = pixels(item.bitmap)
+      for _, tilt in array<double> { -0.00000001, 0, 0.00000001 } do
+         local q = dice_physics.quatMultiply(dice_physics.axisAngle(0, 0, 1, heading),
+            dice_physics.axisAngle(0, 1, 0, math.pi / 2 + tilt))
+         local points = array<table> { }
+         for _, vertex in dice_shapes.get(6).vertices do
+            local point = dice_physics.rotatePoint(q, vertex)
+            points.push({ x=48 + point.x * 28, y=48 + point.y * 28 })
+         end
+         outline.sequence = dice_render.roundedHullSequence(dice_render.convexHull(points), 7)
+         item.renderer.submit()
+         finish(item.renderer)
+         assert(pixels(item.bitmap) is reference, 'Every face-on corner must match the rounded square mask')
+      end
+   end
+end
+
+@Test function ShortOutlineEdgesPreserveCornerRadius()
+   local item = newScene()
+   defer item.renderer.close() end
+   local path = item.root.new('VectorPath', { fill='#9050b0a0', sequence=
+      'M 20,27 A 7,7 0 0 1 27,20 L 69,20 A 7,7 0 0 1 76,27 ' ..
+      'L 76,69 A 7,7 0 0 1 69,76 L 27,76 A 7,7 0 0 1 20,69 Z' })
+   item.renderer.submit()
+   finish(item.renderer)
+   local reference = pixels(item.bitmap)
+   -- A small tilt adds short bevel edges at opposite corners.  These lie outside the rounded square,
+   -- so they must not change its pixels or reduce the radius at just those corners.
+   for _, bevel in array<double> { 0.01, 0.1, 0.5, 1, 2 } do
+      local hull = array<table> {
+         { x=20, y=20 + bevel }, { x=20 + bevel, y=20 }, { x=76, y=20 },
+         { x=76, y=76 - bevel }, { x=76 - bevel, y=76 }, { x=20, y=76 }
+      }
+      path.sequence = dice_render.roundedHullSequence(hull, 7)
+      item.renderer.submit()
+      finish(item.renderer)
+      assert(pixels(item.bitmap) is reference, f'Short {bevel}px bevels changed the corner radius')
+   end
+end

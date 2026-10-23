@@ -1,0 +1,760 @@
+#!/usr/bin/env origo
+
+   import 'gui', 'gui/window', 'options'
+   import './shapes', './physics', './async', './render', './view', './options'
+   import './dev/replay', './dev/benchmark' -- Not included in the release build
+
+   include 'display', 'vector'
+
+   module display as mGfx
+   module vector as mVec
+
+DICE_THEMES <const> = array<table> {
+   { name='white',  red=250, green=245, blue=228, body='#d8d3c5', pips='#17191dc0', glow='#d690ff' },
+   { name='red',    red=230, green=65,  blue=65,  body='#b63232', pips='#fff8e8', glow='#ffd23c' },
+   { name='blue',   red=70,  green=135, blue=235, body='#376bb8', pips='#fff8e8', glow='#4ff0ff' },
+   { name='green',  red=65,  green=180, blue=110, body='#338d56', pips='#fff8e8', glow='#b4ff3c' },
+   { name='yellow', red=250, green=215, blue=75,  body='#c4a93b', pips='#17191d', glow='#ff6a1a' },
+   { name='orange', red=245, green=145, blue=55,  body='#c0722b', pips='#17191d', glow='#ffe84a' },
+   { name='purple', red=165, green=100, blue=220, body='#824fad', pips='#fff8e8', glow='#ff6ef0' },
+   { name='black',  red=65,  green=70,  blue=80,  body='#33373f', pips='#fff8e8', glow='#8fd8ff' }
+}
+
+   glThemeNames = ''
+   for i, theme in DICE_THEMES do
+      if i > 0 then glThemeNames ..= ', ' end
+      glThemeNames ..= theme.name
+   end
+
+   glPreferredShapes = array<table> { dice_shapes.get(6) }
+   glPreferredThemes = array<table> { }
+   _, glDisplayInfo = check mGfx.GetDisplayInfo()
+   -- Compute max scale that would take up the width of the monitor
+   glMaxScale = glDisplayInfo.monitorWidth / (2 * math.sqrt(3) * dice_view.layout(1).radius)
+   -- Now reduce it to a more reasonable maximum
+   glMaxScale /= 3
+
+   glParser = options({
+      name        = 'Upchuck',
+      cmdName     = 'upchuck',
+      description = 'Throw a vector-rendered polyhedral die around the desktop.',
+      autoHelp    = false,
+      epilog      = [[
+Examples:
+  origo projects/upchuck/dice.tiri sides=20
+  origo projects/upchuck/dice.tiri dice=6 sides=4,6,8,10,12,20
+  origo projects/upchuck/dice.tiri dice=3 scale=0.75
+  origo projects/upchuck/dice.tiri face=num font="Noto Sans"
+  origo projects/upchuck/dice.tiri dice=6 scale=1.5 debug --log-info
+  origo projects/upchuck/dice.tiri replay=throw.json debug --log-info
+]],
+      args        = array<table> {
+         { name = 'dice', type = 'int', default = 1,
+           comment = 'Number of dice to roll, from 1 to 6.',
+           exec = function(Parser:table, ArgName:str!, Value:any!, Param:table)
+              if Value < 1 or Value > 6 then raise f"Parameter '{ArgName}' must be between 1 and 6." end
+           end },
+         { name = 'sides', type = 'str', default = '6',
+           comment = 'Sides per die: 4, 6, 8, 10, 12 or 20; comma-separated lists repeat in order.',
+           exec = function(Parser:table, ArgName:str!, Value:any!, Param:table)
+              glPreferredShapes.clear()
+              for _, text in Value.split(',') do
+                 local sides = tonumber(text.trim())
+                 if not sides then raise 'Specify numeric dice sides, such as sides=20 or sides=6,20.' end
+                 glPreferredShapes.push(dice_shapes.get(sides))
+              end
+              if #glPreferredShapes is 0 then raise 'Specify at least one die shape.' end
+           end },
+         { name = 'scale', type = 'num', default = 1.0,
+           comment = 'Dice size multiplier; 1.0 is the normal size.',
+           exec = function(Parser:table, ArgName:str!, Value:any!, Param:table)
+              if Value < 0.1 or Value > glMaxScale then
+                 raise f"Parameter '{ArgName}' must be 0.1 < scale < {string.format('%.3f', glMaxScale)}."
+              end
+           end },
+         { name = 'renderThreads', kind = 'flag', default = true,
+           comment = 'Draw each scene directly into its surface buffer using an action thread.' },
+         { name = 'threaded', kind = 'flag', default = true,
+           comment = 'Run physics in a persistent worker; threaded=false selects the original timer solver.' },
+         { name = 'benchmark', type = 'num', default = 0,
+           comment = 'Benchmark for this many seconds after a 2-second warm-up, then exit.',
+           exec = function(Parser:table, ArgName:str!, Value:any!, Param:table)
+              if not (Value >= 0 and Value < math.huge) then
+                 raise 'Benchmark duration must be finite and non-negative.'
+              end
+           end },
+         { name = 'benchStall', type = 'num', default = 0,
+           comment = 'Benchmark only: block the UI for this many milliseconds every second.',
+           exec = function(Parser:table, ArgName:str!, Value:any!, Param:table)
+              if not (Value >= 0 and Value <= 500) then raise 'Benchmark stall must be between 0 and 500 ms.' end
+           end },
+         { name = 'debug', kind = 'flag', default = false,
+           comment = 'Emit rate-limited physics diagnostics with --log-info.' },
+         { name = 'face', type = 'str', default = 'pips',
+           comment = 'D6 markings: pips or num. Other dice always use numbers.',
+           exec = function(Parser:table, ArgName:str!, Value:any!, Param:table)
+              if Value != 'pips' and Value != 'num' then raise 'Face style must be pips or num.' end
+           end
+         },
+         { name = 'font', type = 'str', default = 'sans-serif',
+           comment = 'Font family for number labels; comma-separated fallback families are supported.' },
+         { name = 'shading', kind = 'flag', default = false,
+           comment = 'Apply directional linear-gradient lighting to dice faces.' },
+         { name = 'opacity', type = 'num', default = 1.0,
+           comment = 'Face opacity from 0 (invisible) to 1 (solid); below 1 renders all sides.',
+           exec = function(Parser:table, ArgName:str!, Value:any!, Param:table)
+              if not (Value >= 0 and Value <= 1) then
+                 raise f"Parameter '{ArgName}' must be between 0 and 1."
+              end
+           end },
+         { name = 'replay', type = 'str',
+           comment = 'Load a throw JSON file, restoring its dice, colours, scale and physics bounds. ' ..
+              'Throws are logged as JSON with --log-info; save the JSON without the log prefix.' },
+         { name = 'colours', type = 'str',
+           comment = 'Comma-separated themes, repeated in order: ' .. glThemeNames ..
+              ', random. Default: random colours.',
+           exec = function(Parser:table, ArgName:str!, Value:any!, Param:table)
+              glPreferredThemes.clear()
+              for name in values(Value.split(',')) do
+                 local requested = name.trim().lower()
+                 local selected:table
+                 if requested is 'random' then
+                    selected = { name='random' }
+                 else
+                    for _, theme in DICE_THEMES do
+                       if theme.name is requested then selected = theme; break end
+                    end
+                 end
+                 if not selected then
+                    raise f"Unknown dice colour '{name}'. Choose from: {glThemeNames}, random."
+                 end
+                 glPreferredThemes.push(selected)
+              end
+              if #glPreferredThemes is 0 then raise 'Specify at least one dice colour.' end
+           end },
+         { name = 'help', kind = 'flag', hidden = true,
+           exec = function(Parser:table!)
+              print(Parser.getHelp())
+              raise ERR_Terminate
+           end }
+      }
+   })
+
+   glArgs = glParser.process()
+   if glArgs is nil then return end
+
+-- Each invocation owns one complete dice runtime.  Applying options returns to the outer loop after cleanup.
+
+function runRuntime():table
+   glColourPool = DICE_THEMES.clone()
+   glDice = array<table> { }
+   physics_worker:table
+   timer:userdata
+   glOptionsWindow:table
+   pending_settings:table
+   stopping = false
+
+   defer
+      for _, die in glDice do die.window.surface?.free() end
+   end
+   defer
+      for _, die in glDice do die.renderer?.close() end
+   end
+   defer
+      if physics_worker then physics_worker.close() end
+   end
+
+   -- Callbacks can run while workers and drawing actions are joined.  Disable them before releasing any objects.
+   defer
+      stopping = true
+      if timer then mSys.UpdateTimer(timer, 0) end
+      if glOptionsWindow then
+         glOptionsWindow.colourMenu.hide()
+         glOptionsWindow.window.surface.free()
+         glOptionsWindow = nil
+      end
+   end
+
+   processing.flush()
+
+   glReplay:table
+   if glArgs.replay then
+      glReplay = dice_replay.decode(io.readAll(glArgs.replay))
+      glArgs.scale = glReplay.scale
+      glArgs.dice = #glReplay.dice
+      glPreferredThemes.clear()
+      glPreferredShapes.clear()
+      for _, die in glReplay.dice do
+         glPreferredShapes.push(dice_shapes.get(die.sides))
+         local selected:table
+         for _, theme in DICE_THEMES do
+            if theme.name is die.theme then selected = theme; break end
+         end
+
+         if not selected then raise f"Unknown replay theme '{die.theme}'." end
+         glPreferredThemes.push(selected)
+      end
+   end
+
+   DICE_SCALE        <const> = glArgs.scale
+   LAYOUT            <const> = dice_view.layout(DICE_SCALE)
+   WINDOW_SIZE       <const> = LAYOUT.size
+   CUBE_RADIUS       <const> = LAYOUT.radius
+   CENTRE            <const> = LAYOUT.centre
+   TICK_RATE         <const> = 1 / 60
+   MAX_FRAME_TIME    <const> = 0.1 -- Discard longer stalls instead of simulating them, which can outlast the stall
+   CONTACT_TOLERANCE <const> = 1.5 * DICE_SCALE
+   DEBUG_PHYSICS     <const> = glArgs.debug
+   DICE_COUNT        <const> = glArgs.dice
+
+   local quatMultiply = dice_physics.quatMultiply
+   local axisAngle = dice_physics.axisAngle
+   local rotatePoint = dice_physics.rotatePoint
+
+   function randomOrientation():table
+      -- Shoemake's construction produces a uniform random rotation rather than favouring particular axes.
+
+      local u1, u2, u3 = math.random(), math.random(), math.random()
+      local lower = math.sqrt(1 - u1)
+      local upper = math.sqrt(u1)
+      local angle1 = 2 * math.pi * u2
+      local angle2 = 2 * math.pi * u3
+      return {
+         w=upper * math.cos(angle2),
+         x=lower * math.sin(angle1),
+         y=lower * math.cos(angle1),
+         z=upper * math.sin(angle2)
+      }
+   end
+
+   CLUSTER_OFFSETS <const> = array<table> {
+      { x=-3.05, y=1.98 }, { x=3.02, y=0.62 }, { x=-0.48, y=3.82 },
+      { x=0.44, y=-3.84 }, { x=0.18, y=0.96 }
+   }
+
+   function createDie(Index:num!):table
+      local shape = glPreferredShapes[Index % #glPreferredShapes]
+      local assigned_theme:table
+      local theme:table
+      if #glPreferredThemes > 0 then
+         assigned_theme = glPreferredThemes[Index % #glPreferredThemes]
+         if assigned_theme.name != 'random' then theme = assigned_theme end
+      end
+
+      if not theme then
+         local selected = glArgs.benchmark > 0 ? 0 : math.random(0, #glColourPool - 1)
+         theme = glColourPool[selected]
+         glColourPool.remove(selected)
+      end
+
+      -- X11 needs unmanaged windows so the window manager cannot clamp the transparent margins to the screen.
+      local window = gui.window({
+         title = 'Upchuck', presence = SPT_NONE, composite = true, stickToFront = true,
+         insideWidth = WINDOW_SIZE, insideHeight = WINDOW_SIZE, quit = false
+      })
+      window.bkgd.fill = '#00000000'
+
+      local root = window.clientViewport({ viewWidth=WINDOW_SIZE, viewHeight=WINDOW_SIZE })
+      local renderer:table
+
+      if glArgs.renderThreads then renderer = dice_render.new(root.scene, window.surface) end
+
+      local view = dice_view.new(root, shape, theme, {
+         radius=CUBE_RADIUS, cornerRadius=LAYOUT.cornerRadius, centre=CENTRE, shading=glArgs.shading,
+         opacity=glArgs.opacity, face=glArgs.face, font=glArgs.font
+      })
+
+      local q = quatMultiply(
+         axisAngle(1, 0.35 + (Index * 0.08), 0.2, 0.85 + (Index * 0.17)),
+         axisAngle(0.1, 1, 0.4, -0.7 + (Index * 0.31)))
+
+      return {
+         index         = Index,
+         shape         = shape,
+         theme         = theme,
+         assignedTheme = (assigned_theme and assigned_theme.name != 'random') ? assigned_theme.name : nil,
+         window        = window,
+         root          = root,
+         renderer      = renderer,
+         renderDirty   = false,
+         view          = view,
+         state = {
+            q     = q,
+            shape = shape,
+            wx    = 2.7 + (Index * 0.31), wy = -4.1 + (Index * 0.27), wz = 3.2 - (Index * 0.19),
+            vx    = 135 + (Index * 11), vy = -60 - (Index * 8),
+            x     = 0,
+            y     = 0,
+            groundTime = 0,
+            stopped    = false,
+            roll       = 1,
+            frame      = 0,
+            bounds     = nil
+         }
+      }
+   end
+
+   function bottomFaceAlignment(Die:table!):num
+      state = Die.state
+      alignment = -1
+      for _, face in Die.shape.faces do
+         alignment = math.max(alignment, rotatePoint(state.q, face.normal).y)
+      end
+      return alignment
+   end
+
+   function kineticEnergy(Die:table!):num
+      state = Die.state
+      linear = (state.vx * state.vx) + (state.vy * state.vy)
+      angular = (state.wx * state.wx) + (state.wy * state.wy) + (state.wz * state.wz)
+      return (0.5 * linear) + (0.5 * Die.shape.inertia * CUBE_RADIUS * CUBE_RADIUS * angular)
+   end
+
+   function physicsLog(Die:table!, Event:str!, Bounds:table, Detail:str)
+      if not DEBUG_PHYSICS then return end
+
+      state = Die.state
+      bounds = Bounds ?? state.bounds
+      contact = bounds?.contact ?? { x=0, y=0, z=0 }
+      support_mask = bounds?.supportMask ?? 0
+      contacts = bounds?.contacts ?? 0
+      face, face_area = dice_shapes.winner(Die.shape, state.q)
+      linear = math.sqrt((state.vx * state.vx) + (state.vy * state.vy))
+      angular = math.sqrt((state.wx * state.wx) + (state.wy * state.wy) + (state.wz * state.wz))
+      msg(string.format(
+         '[Upchuck physics] die=%d event=%s roll=%d frame=%d pos=(%.2f,%.2f) v=(%.3f,%.3f;%.3f) ' ..
+         'w=(%.4f,%.4f,%.4f;%.4f) q=(%.6f,%.6f,%.6f,%.6f) align=%.6f face=%d faceArea=%.6f ' ..
+         'support=0x%02x/%d contact=(%.3f,%.3f,%.3f) energy=%.3f ground=%.3f stopped=%s %s',
+         Die.index + 1, Event, state.roll, state.frame, state.x, state.y, state.vx, state.vy, linear,
+         state.wx, state.wy, state.wz, angular, state.q.w, state.q.x, state.q.y, state.q.z,
+         bottomFaceAlignment(Die), face, face_area, support_mask, contacts, contact.x, contact.y, contact.z,
+         kineticEnergy(Die), state.groundTime, tostring(state.stopped), Detail ?? ''))
+   end
+
+   function renderDie(Die:table!):<table, bool>
+      if Die.renderer then
+         if Die.renderer.failure then raise Die.renderer.failure end
+         if Die.renderer.busy then
+            Die.renderDirty = true
+            return Die.lastBounds, false
+         end
+      end
+
+      Die.renderDirty = false
+      state = Die.state
+      points = dice_view.draw(Die.view, state.q, state.stopped)
+      bounds = { minX=math.huge, maxX=-math.huge, minY=math.huge, maxY=-math.huge }
+
+      for _, point in points do
+         bounds.minX = math.min(bounds.minX, point.x)
+         bounds.maxX = math.max(bounds.maxX, point.x)
+         bounds.minY = math.min(bounds.minY, point.y)
+         bounds.maxY = math.max(bounds.maxY, point.y)
+      end
+
+      -- The average is only a diagnostic marker; the physics solver retains each contact vertex separately.
+
+      local contact_x, contact_y, contact_z, contacts, support_mask = 0, 0, 0, 0, 0
+      for i, point in points do
+         if bounds.maxY - point.y <= CONTACT_TOLERANCE then
+            contact_x += point.x - CENTRE
+            contact_y += point.y - CENTRE
+            contact_z += point.z
+            contacts++
+            support_mask = support_mask | (1 << i)
+         end
+      end
+
+      bounds.contact = {
+         x=contact_x / contacts, y=contact_y / contacts, z=contact_z / contacts
+      }
+
+      bounds.contacts = contacts
+      bounds.supportMask = support_mask
+
+      state.bounds = bounds
+      Die.lastBounds = bounds
+      if Die.renderer then Die.renderer.submit()
+      else Die.window.surface.mtScheduleRedraw() end
+      return bounds, true
+   end
+
+   function moveWindow(Die:table!)
+      Die.window.surface.acMoveToPoint(Die.state.x - CENTRE, Die.state.y - CENTRE, 0, MTF_X | MTF_Y)
+   end
+
+   for i in {0 to DICE_COUNT} do
+      glDice.push(createDie(i))
+   end
+
+   left   = glDisplayInfo.monitorX
+   top    = glDisplayInfo.monitorY
+   right  = left + glDisplayInfo.monitorWidth
+   bottom = top + glDisplayInfo.monitorHeight
+   if glArgs.benchmark > 0 and not glReplay then
+      left, top, right, bottom = 0, 0, 1920, 1080
+   end
+
+   world:table = dice_physics.newWorld(CUBE_RADIUS, left, right, bottom)
+
+   if glReplay then
+      world = glReplay.world
+      for i, die in glDice do
+         die.state = glReplay.dice[i].state
+         die.state.shape = die.shape
+      end
+   end
+
+   bodies = array<table> { }
+   for _, die in glDice do
+      bodies.push(die.state)
+   end
+
+   function captureDisplay(Info)
+      -- Non-hosted drivers can return window information without a monitor rectangle.
+      if Info.monitorWidth <= 0 or Info.monitorHeight <= 0 then
+         Info = glDisplayInfo
+      end
+
+      world.left = Info.monitorX
+      world.right = Info.monitorX + Info.monitorWidth
+      world.bottom = Info.monitorY + Info.monitorHeight
+   end
+
+   function collectDice(Main:table!, BaseX:num!, BaseY:num!, ResetMotion:bool!):table
+      local offsets = {}
+      local slot = 0
+      for _, die in glDice do
+         local offset
+         if die is Main then
+            offset = { x=0, y=0 }
+         else
+            local layout = CLUSTER_OFFSETS[slot]
+            offset = { x=layout.x * CUBE_RADIUS, y=layout.y * CUBE_RADIUS }
+            slot++
+         end
+
+         offsets[die.index] = offset
+         die.state.x = BaseX + offset.x
+         die.state.y = BaseY + offset.y
+         die.state.stopped = false
+         die.state.renderedStopped = false
+
+         if ResetMotion then
+            die.state.vx, die.state.vy = 0, 0
+            die.state.wx, die.state.wy, die.state.wz = 0, 0, 0
+            die.state.q = randomOrientation()
+            renderDie(die)
+         end
+
+         moveWindow(die)
+      end
+      return offsets
+   end
+
+   local centre_x = left + ((right - left) * 0.5)
+   local centre_y = top + ((bottom - top) * 0.5)
+   if not glReplay then
+      collectDice(glDice[0], centre_x, centre_y, false)
+      dice_physics.separate(bodies, world, 80)
+   end
+
+   msg(dice_replay.capture(glDice, world, DICE_SCALE))
+
+   for _, die in glDice do
+      local initial_bounds = renderDie(die)
+      moveWindow(die)
+      physicsLog(die, 'start', initial_bounds, '')
+   end
+
+   if glArgs.threaded then
+      physics_worker = dice_async.new(obj.find('self').workingPath .. 'worker.tiri',
+         dice_replay.capture(glDice, world, DICE_SCALE))
+   end
+
+   local drag, last_time
+
+   function applyOptions(Settings:table!)
+      if stopping or pending_settings then return end
+      pending_settings = Settings
+      processing.signal()
+   end
+
+   function openOptions()
+      if stopping or pending_settings or glArgs.benchmark > 0 then return end
+
+      if glOptionsWindow then
+         glOptionsWindow.window.moveToFront()
+         return
+      end
+
+      local dice = array<table>
+      for i in {0 to 6} do
+         if i < #glDice then
+            dice.push({ theme=glDice[i].assignedTheme })
+         else
+            dice.push({ theme=nil })
+         end
+      end
+
+      local settings = {
+         diceCount=#glDice, sides=glDice[0].shape.sides, dice=dice, scale=glArgs.scale, maxScale=glMaxScale,
+         face=glArgs.face, font=glArgs.font, shading=glArgs.shading, opacity=glArgs.opacity
+      }
+
+      glOptionsWindow = dice_options.open(settings, DICE_THEMES, applyOptions, function()
+         glOptionsWindow = nil
+      end)
+   end
+
+   function subscribeDie(Die:table!)
+      Die.root.mtSubscribeInput(JTYPE_BUTTON | JTYPE_MOVEMENT, function(Viewport:obj!, Msg:any!)
+         if stopping or pending_settings then return end
+         repeat
+            if ((Msg.type is JET_BUTTON_2) and (Msg.value > 0)) or
+               ((Msg.type is JET_LMB) and (Msg.value > 0) and (Msg.flags has JTYPE_DBL_CLICK)) then
+               openOptions()
+            elseif Msg.type is JET_LMB then
+               if (Msg.value > 0) and not drag then
+                  local err, cursor_x, cursor_y = mGfx.GetCursorPos()
+                  if err is ERR_Okay then
+                     physics_worker?.pause()
+
+                     local state = Die.state
+                     state.x = Die.window.surface.x + CENTRE
+                     state.y = Die.window.surface.y + CENTRE
+
+                     drag = {
+                        main=Die, cursorX=cursor_x, cursorY=cursor_y, x=state.x, y=state.y,
+                        samples=array<table> { { x=cursor_x, y=cursor_y, time=mSys.PreciseTime() / 1000000 } },
+                        offsets=collectDice(Die, state.x, state.y, true)
+                     }
+
+                     physicsLog(Die, 'drag_begin', state.bounds, '')
+                  end
+               elseif drag and (drag.main is Die) then
+                  local _, target_display = check mGfx.GetDisplayInfo(Die.window.surface.display)
+
+                  captureDisplay(target_display)
+
+                  local vx, vy = dice_physics.releaseVelocity(drag.samples, mSys.PreciseTime() / 1000000)
+                  local speed = math.sqrt(vx * vx + vy * vy)
+                  local velocity_jitter = math.min(40 * DICE_SCALE, 12 * DICE_SCALE + speed * 0.04)
+                  local spin_jitter = 0.6 + math.min(1.2, speed / (500 * DICE_SCALE))
+
+                  for _, die in glDice do
+                     local state = die.state
+                     -- Small independent release impulses suggest dice slipping out of the hand.  The pointer still
+                     -- supplies the main throw; gentle releases receive only a little movement and tumble.
+                     state.vx = math.clamp(vx + (math.random() * 2 - 1) * velocity_jitter, -1250, 1250)
+                     state.vy = math.clamp(vy + (math.random() * 2 - 1) * velocity_jitter, -1250, 1250)
+                     state.wx = (math.random() * 2 - 1) * spin_jitter
+                     state.wy = (math.random() * 2 - 1) * spin_jitter
+                     state.wz = (math.random() * 2 - 1) * spin_jitter
+                     state.groundTime = 0
+                     state.balanceTime = 0
+                     state.roll++
+                     state.frame = 0
+                     physicsLog(die, 'release', state.bounds, f"main={Die.index + 1}")
+                  end
+
+                  dice_physics.separate(bodies, world, 80)
+                  for _, die in glDice do moveWindow(die) end
+                  drag = nil
+                  world.accumulator = 0
+                  local throw = dice_replay.capture(glDice, world, DICE_SCALE)
+                  msg(throw)
+
+                  physics_worker?.reset(throw)
+                  last_time = mSys.PreciseTime()
+               end
+            elseif drag and (drag.main is Die) and (Msg.type is JET_ABS_XY) then
+               local err, cursor_x, cursor_y = mGfx.GetCursorPos()
+               if err is ERR_Okay then
+                  local now = mSys.PreciseTime() / 1000000
+                  drag.samples.push({ x=cursor_x, y=cursor_y, time=now })
+                  while #drag.samples > 2 and now - drag.samples[0].time > 0.1 do drag.samples.remove(0) end
+                  local base_x = drag.x + cursor_x - drag.cursorX
+                  local base_y = drag.y + cursor_y - drag.cursorY
+                  for _, die in glDice do
+                     local offset = drag.offsets[die.index]
+                     die.state.x = base_x + offset.x
+                     die.state.y = base_y + offset.y
+                     moveWindow(die)
+                  end
+               end
+            end
+            Msg = Msg.next
+         until not Msg
+      end)
+
+      Die.root.mtSubscribeKeyboard(function(Viewport:obj!, Qualifiers:num!, Value:num!, Unicode)
+         if stopping or pending_settings then return end
+         if (Qualifiers has KQ_PRESSED) and (Value is KEY_ESCAPE) then mSys.SendMessage(MSGID_QUIT) end
+      end)
+   end
+
+   for _, die in glDice do subscribeDie(die) end
+
+   local benchmark:table
+   local benchmark_throw:str
+   if glArgs.benchmark > 0 then
+      benchmark = dice_benchmark.new(glArgs.benchmark, glArgs.benchStall)
+      benchmark_throw = dice_replay.capture(glDice, world, DICE_SCALE)
+   end
+
+   local benchmark_done = false
+   local timer_failure:str
+   _, timer = check mSys.SubscribeTimer(TICK_RATE, function(Subscriber, Elapsed, CurrentTime)
+      if stopping or pending_settings or benchmark_done or timer_failure then return end
+      try
+         if drag then
+            for _, die in glDice do
+               if die.renderer?.failure then raise die.renderer.failure end
+               if die.renderDirty then renderDie(die) end
+            end
+            return
+         end
+
+         local tick_start = mSys.PreciseTime()
+         if benchmark then
+            if benchmark.finished() then
+               benchmark_done = true
+               mSys.SendMessage(MSGID_QUIT)
+               return
+            end
+
+            if benchmark.reset() then
+               local replay = dice_replay.decode(benchmark_throw)
+               world = replay.world
+               bodies.clear()
+               for i, die in glDice do
+                  die.state = replay.dice[i].state
+                  bodies.push(die.state)
+               end
+
+               if physics_worker then physics_worker.reset(benchmark_throw, true) end
+               last_time = CurrentTime
+            end
+         end
+
+         local dt = TICK_RATE
+         if last_time then dt = math.clamp((CurrentTime - last_time) / 1000000, 0, MAX_FRAME_TIME) end
+         last_time = CurrentTime
+         local physics_start = mSys.PreciseTime()
+         local updated = true
+         if physics_worker then
+            local snapshot = physics_worker.read()
+            updated = snapshot != nil
+            if snapshot then
+               if benchmark then benchmark.observe(snapshot) end
+               for i, state in snapshot.states do
+                  local target = glDice[i].state
+                  for key, value in state do target[key] = value end
+               end
+            end
+         else
+            dice_physics.advance(bodies, world, dt)
+         end
+
+         local physics_end = mSys.PreciseTime()
+
+         local render_start = mSys.PreciseTime()
+         local rendered = false
+         for _, die in glDice do
+            local state = die.state
+            if die.renderer?.failure then raise die.renderer.failure end
+            if not die.renderDirty and (not updated or (state.stopped and state.renderedStopped)) then continue end
+            local bounds, submitted = renderDie(die)
+            if submitted then
+               rendered = true
+               state.frame++
+               state.renderedStopped = state.stopped
+            end
+            if submitted and DEBUG_PHYSICS and state.frame % 30 is 0 then
+               physicsLog(die, state.stopped ? 'rest' : 'motion', bounds, '')
+            end
+         end
+         -- Queue every die before moving windows: movement can expose the buffer and wait for a draw to finish.
+         if updated then for _, die in glDice do moveWindow(die) end end
+         if benchmark then
+            local render_end = mSys.PreciseTime()
+            benchmark.record(tick_start, physics_end - physics_start, render_end - render_start,
+               render_end - tick_start, rendered)
+            benchmark.stall()
+         end
+      except e
+         timer_failure = e.message
+         mSys.SendMessage(MSGID_QUIT)
+      end
+   end)
+
+   for _, die in glDice do die.window.show() end
+   repeat
+      local err = processing.sleep()
+      if err is ERR_Terminate then
+         pending_settings = nil
+         break
+      end
+      check err
+   until pending_settings
+
+   stopping = true
+   mSys.UpdateTimer(timer, 0)
+   timer = nil
+   for _, die in glDice do
+      if die.renderer then
+         die.renderer.close()
+         if die.renderer.failure then timer_failure = die.renderer.failure end
+      end
+   end
+
+   if timer_failure then raise timer_failure end
+
+   local metrics:table
+   if physics_worker then metrics = physics_worker.close() end
+
+   if benchmark_done then
+      -- Per-die render totals include warmup; completion latency includes waiting for main-thread dispatch.
+      local rendering = { mode=glArgs.renderThreads ? 'direct' : 'scheduled', lifetime=array<table> { } }
+      for _, die in glDice do
+         if die.renderer then
+            local r = die.renderer
+            rendering.lifetime.push({ die=die.index + 1, frames=r.completed,
+               rasterMS=r.rasterTime / math.max(1, r.completed) / 1000,
+               completionMS=r.elapsed / math.max(1, r.completed) / 1000 })
+         end
+      end
+
+      benchmark.report(glArgs.threaded ? 'worker' : 'main', DICE_COUNT, glArgs.sides, metrics,
+         rendering)
+   end
+
+   return pending_settings
+end
+
+   while true do
+      local settings = runRuntime()
+      if not settings then break end
+
+      glArgs.dice = settings.diceCount
+      glArgs.sides = tostring(settings.sides)
+      glArgs.scale = settings.scale
+      glArgs.face = settings.face
+      glArgs.font = settings.font
+      glArgs.shading = settings.shading
+      glArgs.opacity = settings.opacity
+      glArgs.replay = nil
+
+      glPreferredShapes.clear()
+      glPreferredShapes.push(dice_shapes.get(settings.sides))
+      glPreferredThemes.clear()
+      for i in {0 to settings.diceCount} do
+         local name = settings.dice[i].theme
+         local selected:table
+         for _, theme in DICE_THEMES do
+            if theme.name is name then selected = theme; break end
+         end
+         glPreferredThemes.push(selected ?? { name='random' })
+      end
+   end

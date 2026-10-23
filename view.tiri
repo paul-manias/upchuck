@@ -1,0 +1,340 @@
+-- Vector construction and posing for a single die.  The runtime dice and the options preview share this code, so the
+-- preview always matches the appearance of a thrown die.
+
+   import 'gui'
+   import './shapes', './physics', './render'
+
+   include 'vector'
+
+   module vector as mVec
+
+   namespace dice_view { }
+
+DIE_RADIUS        <const> = 72  -- Vertex radius of a die at a scale of 1
+DIE_CORNER_RADIUS <const> = 14
+DIE_WINDOW_SIZE   <const> = 280 -- Square window that contains a die at any orientation, with a margin
+
+PIP_LAYOUTS <const> = array<array<double>> {
+   array<double> {  0,  0 },
+   array<double> { -0.46, -0.46,  0.46,  0.46 },
+   array<double> { -0.46, -0.46,  0,  0,  0.46,  0.46 },
+   array<double> { -0.46, -0.46,  0.46, -0.46, -0.46,  0.46,  0.46,  0.46 },
+   array<double> { -0.46, -0.46,  0.46, -0.46,  0,  0, -0.46,  0.46,  0.46,  0.46 },
+   array<double> { -0.46, -0.50, -0.46,  0, -0.46,  0.50,  0.46, -0.50,  0.46,  0,  0.46,  0.50 }
+}
+
+local rotatePoint = dice_physics.rotatePoint
+
+function faceLight(Normal:table!):num
+   local lx, ly, lz = -0.36, -0.55, 0.75
+   local length = math.sqrt((lx * lx) + (ly * ly) + (lz * lz))
+   local diffuse = math.max(0, ((Normal.x * lx) + (Normal.y * ly) + (Normal.z * lz)) / length)
+   return 0.52 + (0.48 * diffuse)
+end
+
+function faceColour(Normal:table!, Theme:table!):str
+   local light = faceLight(Normal)
+   return string.format('#%02x%02x%02x',
+      math.round(Theme.red * light), math.round(Theme.green * light), math.round(Theme.blue * light))
+end
+
+function shadeFace(Face:table!, Normal:table!, Points:array<table>!, Theme:table!)
+   -- Project the light onto the face plane, then onto the screen.  The gradient follows the tumbling face.
+   local dot = Normal.x * -0.36 + Normal.y * -0.55 + Normal.z * 0.75
+   local dx, dy = -0.36 - Normal.x * dot, -0.55 - Normal.y * dot
+   local length = math.sqrt(dx * dx + dy * dy)
+   if length < 0.0001 then
+      Face.path.fill = faceColour(Normal, Theme)
+      return
+   end
+
+   dx, dy = dx / length, dy / length
+   local cx, cy = 0, 0
+
+   for _, point in Points do cx += point.x; cy += point.y end
+
+   cx, cy = cx / #Points, cy / #Points
+   local lower, upper = math.huge, -math.huge
+
+   for _, point in Points do
+      local distance = (point.x - cx) * dx + (point.y - cy) * dy
+      lower, upper = math.min(lower, distance), math.max(upper, distance)
+   end
+
+   if upper - lower < 0.0001 then
+      Face.path.fill = faceColour(Normal, Theme)
+      return
+   end
+
+   local gradient = Face.gradient
+   gradient.x1, gradient.y1 = cx + dx * lower, cy + dy * lower
+   gradient.x2, gradient.y2 = cx + dx * upper, cy + dy * upper
+   local light = faceLight(Normal)
+   for i, stop in Face.stops do
+      local level = math.clamp(light + (i is 0 ? -0.18 : 0.18) * length, 0, 1)
+      stop.rgb.red = Theme.red * level / 255
+      stop.rgb.green = Theme.green * level / 255
+      stop.rgb.blue = Theme.blue * level / 255
+   end
+   gradient.stops = Face.stops
+   Face.path.fill = Face.gradientFill
+end
+
+function setAffine(Matrix, Origin:table!, U:table!, V:table!, Scale:num)
+   local scale = Scale ?? 1
+   Matrix.scaleX = U.x * scale
+   Matrix.shearY = U.y * scale
+   Matrix.shearX = V.x * scale
+   Matrix.scaleY = V.y * scale
+   Matrix.translateX = Origin.x
+   Matrix.translateY = Origin.y
+   mVec.FlushMatrix(Matrix)
+end
+
+-- Pixel metrics for a die window at the given size multiplier.
+
+dice_view.layout = function(Scale:num!):table
+   local size = math.max(1, math.round(DIE_WINDOW_SIZE * Scale))
+   return { size=size, centre=size * 0.5, radius=DIE_RADIUS * Scale, cornerRadius=DIE_CORNER_RADIUS * Scale }
+end
+
+-- Build the vectors for one die inside Root.  Config fields: radius and cornerRadius (pixels), centre (the pose
+-- origin in Root's coordinates), shading (bool), opacity (0 - 1), face ('pips' or 'num') and font.  Gradient
+-- definitions are registered on Root's scene, so only one view may exist per scene.
+
+dice_view.new = function(Root:obj!, Shape:table!, Theme:table!, Config:table!):table
+   local radius, centre = Config.radius, Config.centre
+   local opacity = Config.opacity
+   local translucent = opacity < 1
+
+   local hidden_pip_colour = Theme.pips
+   if translucent then
+      local pip_colour = gui.strToRGB(Theme.pips)
+      local base_colour = gui.srgb(Theme.red, Theme.green, Theme.blue)
+      hidden_pip_colour = tostring(pip_colour.interpolate(base_colour, opacity))
+   end
+
+   local initial_sequence = string.format(
+      'M %.3f,%.3f L %.3f,%.3f L %.3f,%.3f L %.3f,%.3f Z',
+      centre - radius, centre - radius, centre + radius, centre - radius,
+      centre + radius, centre + radius, centre - radius, centre + radius)
+   local clip = Root.scene.new('VectorClip', { units='UserSpace' })
+   local outline = clip.viewport.new('VectorPath', { sequence=initial_sequence })
+   local body = Root.new('VectorGroup', { mask=clip })
+   local silhouette = body.new('VectorPath', {
+      fill=Theme.body, stroke='none',
+      visibility=translucent ? VIS_HIDDEN : VIS_VISIBLE,
+      lineJoin='round', cursor=PTC_HAND, sequence=initial_sequence
+   })
+
+   local faces = array<table> { }
+   for _, data in Shape.faces do
+      faces.push({
+         data=data,
+         path=body.new('VectorPath', {
+            fill=Theme.body, stroke='none', opacity=opacity, cursor=PTC_HAND,
+            lineJoin='round', sequence=initial_sequence
+         }),
+         pips=array<table> { }
+      })
+   end
+
+   if Config.shading then
+      for i, face in faces do
+         local stops = { [0]=struct<GradientStop>, [1]=struct<GradientStop> }
+         stops[0].offset, stops[1].offset = 0, 1
+         stops[0].rgb.alpha, stops[1].rgb.alpha = 1, 1
+         local name = f'dice_face_{i}'
+         face.gradient = Root.scene.new('GradientLinear', {
+            units='userSpace', x1=0, y1=0, x2=1, y2=0, stops=stops,
+            spreadMethod='pad'
+         })
+
+         check Root.scene.mtAddDef(name, face.gradient)
+         face.stops = stops
+         face.gradientFill = f'url(#{name})'
+      end
+   end
+
+   -- Markings are mapped onto their projected faces, preserving angle and foreshortening while the die tumbles.
+   -- Numbers use a larger font coordinate system to retain glyph detail, scaled down by their affine matrix.
+
+   local glow_colour = gui.strToRGB(Theme.glow)
+   local glow_stops = { }
+   for i, alpha in array<double> { .8, 0.65, 0 } do
+      local stop = struct<GradientStop>
+      stop.offset = i * 0.5
+      stop.rgb.red, stop.rgb.green, stop.rgb.blue = glow_colour.r, glow_colour.g, glow_colour.b
+      stop.rgb.alpha = alpha
+      glow_stops[i] = stop
+   end
+
+   local glow = Root.scene.new('GradientRadial', {
+      cx='50%', cy='50%', radius='50%', stops=glow_stops
+   })
+
+   check Root.scene.mtAddDef('winning_pip_glow', glow)
+
+   for _, face in faces do
+      local numbered = Shape.sides != 6 or Config.face is 'num'
+      local positions = numbered ? array<double> { 0, 0 } : PIP_LAYOUTS[face.data.value - 1]
+      for i in {0 to #positions by 2} do
+         local halo = body.new('VectorEllipse', {
+            cx=positions[i], cy=positions[i + 1], radius=numbered ? 0.9 : 0.27,
+            fill='url(#winning_pip_glow)', visibility=VIS_HIDDEN
+         })
+
+         local _, halo_matrix = check halo.mtNewMatrix(false)
+         local pip:obj
+         if numbered then
+            local label = tostring(face.data.value)
+            if Shape.sides != 6 and (face.data.value is 6 or face.data.value is 9) then label ..= '.' end
+            pip = body.new('VectorText', {
+               x=0, y=43, string=label, face=Config.font, fontStyle='bold',
+               fontSize='120px', align='middle', fill=Theme.pips, visibility=VIS_HIDDEN
+            })
+         else
+            pip = body.new('VectorEllipse', {
+               cx=positions[i], cy=positions[i + 1], radius=0.145, fill=Theme.pips, visibility=VIS_HIDDEN
+            })
+         end
+
+         local _, matrix = check pip.mtNewMatrix(false)
+         pip.opacity = opacity
+         halo.opacity = opacity
+         face.pips.push({ vector=pip, matrix=matrix, halo=halo, haloMatrix=halo_matrix,
+            scale=numbered ? 0.01 : 1 })
+      end
+   end
+
+   return {
+      shape           = Shape,
+      theme           = Theme,
+      config          = Config,
+      translucent     = translucent,
+      body            = body,
+      silhouette      = silhouette,
+      outline         = outline,
+      clip            = clip,
+      glow            = glow,
+      faces           = faces,
+      hiddenPipColour = hidden_pip_colour
+   }
+end
+
+-- Release the view's vectors and scene definitions, so that a replacement view can be built in the same scene.
+
+dice_view.free = function(View:table!)
+   View.body.free()
+   View.clip.free()
+   View.glow.free()
+   for _, face in View.faces do face.gradient?.free() end
+end
+
+-- Pose the die's vectors for orientation Q and return the projected vertices.  Stopped dice highlight their
+-- winning face unless a D6 lands cleanly.  The caller is responsible for scheduling the redraw.
+
+dice_view.draw = function(View:table!, Q:table!, Stopped:bool):array<table>
+   local radius, centre = View.config.radius, View.config.centre
+   local corner_radius = View.config.cornerRadius
+   local translucent = View.translucent
+   local winning_face, _, ambiguous = dice_shapes.winner(View.shape, Q)
+   local points = array<table> { }
+
+   for _, vertex in View.shape.vertices do
+      local r = rotatePoint(Q, vertex)
+      points.push({ x=centre + (r.x * radius), y=centre + (r.y * radius), z=r.z * radius })
+   end
+
+   -- Clip the whole body to one rounded outline so that shaded faces cannot expose sharp corners.
+   -- The hull merges indistinguishable projected vertices before limiting each inset to half an edge.
+
+   local hull = dice_render.convexHull(points)
+   View.silhouette.sequence = dice_render.pathSequence(hull)
+   View.outline.sequence = dice_render.roundedHullSequence(hull, corner_radius)
+
+   local render_faces = View.faces
+   local rear_corners:array<int>
+   if translucent then
+      -- Sort the transformed face centres from back to front.
+
+      render_faces = View.faces.clone()
+      rear_corners = array<int, #View.shape.vertices>
+      for _, face in render_faces do
+         face.normal = rotatePoint(Q, face.data.normal)
+         face.depth = rotatePoint(Q, face.data.centre).z
+         if face.normal.z < -0.0001 then
+            for _, index in face.data.indices do rear_corners[index] += 1 end
+         end
+      end
+
+      render_faces.sort(function(A:table!, B:table!):bool
+         return A.depth < B.depth
+      end)
+   end
+
+   for _, face in render_faces do
+      local normal = translucent ? face.normal : rotatePoint(Q, face.data.normal)
+      local visible = translucent ? math.abs(normal.z) > 0.0001 : normal.z > 0.0001
+      face.path.visibility = visible ? VIS_VISIBLE : VIS_HIDDEN
+
+      local highlight = Stopped and (ambiguous or View.shape.sides != 6) and face.data.value is winning_face
+      for _, pip in face.pips do
+         pip.vector.visibility = visible ? VIS_VISIBLE : VIS_HIDDEN
+         pip.halo.visibility = (visible and highlight) ? VIS_VISIBLE : VIS_HIDDEN
+         if translucent then
+            -- Tint the rear markings themselves, independently of the faces composited over them.
+            pip.vector.fill = normal.z < 0 ? View.hiddenPipColour : View.theme.pips
+         end
+      end
+      if not visible then continue end
+
+      local face_points = array<table> { }
+      for _, index in face.data.indices do
+         face_points.push(points[index])
+      end
+      local square_corners:table
+
+      if View.shape.sides != 6 then
+         -- The rounded hull clips complete polygons; rounding every triangle would open gaps at shared vertices.
+         square_corners = { }
+         for i, _ in face.data.indices do
+            square_corners[i] = true
+         end
+      elseif translucent and normal.z < 0 then
+         square_corners = { }
+         for i, index in face.data.indices do
+            square_corners[i] = rear_corners[index] > 1
+         end
+      end
+
+      face.path.sequence = dice_render.roundedPathSequence(face_points, corner_radius, square_corners)
+
+      if translucent then
+         check face.path.acMoveToFront()
+         for _, pip in face.pips do
+            pip.halo.acMoveToFront()
+            pip.vector.acMoveToFront()
+         end
+      end
+
+      if View.config.shading then
+         shadeFace(face, normal, face_points, View.theme)
+      else
+         face.path.fill = faceColour(normal, View.theme)
+      end
+
+      local centre_point = rotatePoint(Q, face.data.centre)
+      local label_u = rotatePoint(Q, face.data.u)
+      local label_v = rotatePoint(Q, face.data.v)
+      local origin = { x=centre + centre_point.x * radius, y=centre + centre_point.y * radius }
+      local u = { x=label_u.x * radius, y=label_u.y * radius }
+      local v = { x=label_v.x * radius, y=label_v.y * radius }
+      for _, pip in face.pips do
+         setAffine(pip.matrix, origin, u, v, pip.scale)
+         setAffine(pip.haloMatrix, origin, u, v)
+      end
+   end
+
+   return points
+end

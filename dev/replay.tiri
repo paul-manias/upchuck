@@ -1,0 +1,114 @@
+-- Throw snapshots.  Keep binary64 precision so a JSON round trip preserves the solver's starting state.
+
+   import 'json'
+   import '../shapes'
+
+   namespace dice_replay { }
+
+WORLD_FIELDS <const> = array<str> {
+   'radius', 'inertia', 'left', 'right', 'bottom', 'gravity', 'skin', 'sleepSpeed', 'step', 'accumulator'
+}
+
+STATE_FIELDS <const> = array<str> {
+   'x', 'y', 'vx', 'vy', 'wx', 'wy', 'wz', 'groundTime', 'balanceTime', 'roll', 'frame'
+}
+
+function encodeExact(Value:any):str
+   if Value is <num> then return string.format('%.17g', Value) end
+
+   if Value is <array> then
+      parts = array<str> { }
+      for _, item in Value do parts.push(encodeExact(item)) end
+      return '[' .. parts.concat(',') .. ']'
+   elseif Value is <table> then
+      parts = array<str> { }
+      for key, item in Value do parts.push(json.encode(key) .. ':' .. encodeExact(item)) end
+      return '{' .. parts.concat(',') .. '}'
+   end
+
+   return json.encode(Value)
+end
+
+dice_replay.capture = function(Dice:array<table>!, World:table!, Scale:num!):str
+   snapshot = { kind='dice_throw', scale=Scale, world={}, dice=array<table> { } }
+
+   for _, key in WORLD_FIELDS do snapshot.world[key] = World[key] end
+
+   for _, die in Dice do
+      local state = { stopped=die.state.stopped, q={} }
+      for _, key in STATE_FIELDS do
+         state[key] = die.state[key] ?? 0
+      end
+
+      for _, key in array<str> { 'w', 'x', 'y', 'z' } do
+         state.q[key] = die.state.q[key]
+      end
+
+      snapshot.dice.push({ theme=die.theme.name, sides=die.state.shape?.sides ?? 6, state=state })
+   end
+
+   return encodeExact(snapshot)
+end
+
+function requireNumber(Value:any, Name:str!):num
+   if not (Value is <num>) then raise f'Invalid replay: {Name} must be a number.' end
+   if Value != Value or math.abs(Value) is math.huge then
+      raise f'Invalid replay: {Name} must be finite.'
+   end
+   return Value
+end
+
+dice_replay.decode = function(Text:str!):table
+   data, position = json.decode(Text)
+   if Text.sub(position).trim() != '' then
+      raise 'Invalid replay: trailing text after JSON.'
+   end
+
+   if not (data is <table>) or data.kind != 'dice_throw' then
+      raise 'Invalid replay: expected a dice_throw payload.'
+   end
+
+   if requireNumber(data.scale, 'scale') <= 0 then
+      raise 'Invalid replay scale.'
+   end
+
+   if not (data.world is <table>) or not (data.dice is <array>) then
+      raise 'Invalid replay world or dice.'
+   end
+
+   if #data.dice < 1 or #data.dice > 6 then
+      raise 'A replay requires between one and six dice.'
+   end
+
+   world = data.world
+   for _, key in WORLD_FIELDS do requireNumber(world[key], 'world.' .. key) end
+      if world.radius != 72 * data.scale or world.inertia <= 0 or world.skin <= 0 or world.sleepSpeed <= 0 or
+      world.step <= 0 or world.step > 1 or world.accumulator < 0 or world.accumulator >= world.step or
+      world.right - world.left < world.radius * math.sqrt(3) * 2 or world.gravity < 0 then
+      raise 'Invalid replay physics settings.'
+   end
+
+   for _, die in data.dice do
+      if not (die is <table>) or not (die.theme is <str>) or not (die.state is <table>) then
+         raise 'Invalid replay die.'
+      end
+
+      local shape = dice_shapes.get(requireNumber(die.sides, 'sides'))
+      local state = die.state
+      state.shape = shape
+      for _, key in STATE_FIELDS do requireNumber(state[key], 'state.' .. key) end
+      if not (state.stopped is <bool>) or not (state.q is <table>) then raise 'Invalid replay state.' end
+      local norm = 0
+
+      for _, key in array<str> { 'w', 'x', 'y', 'z' } do
+         local component = requireNumber(state.q[key], 'q.' .. key)
+         norm += component * component
+      end
+
+      if math.abs(norm - 1) > 0.000001 then
+         raise 'Invalid replay orientation: expected a unit quaternion.'
+      end
+   end
+
+   return data
+end

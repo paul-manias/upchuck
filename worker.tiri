@@ -1,0 +1,139 @@
+-- Owns the simulation in an isolated Tiri state.  All communication is through complete pool messages.
+
+   import './physics', './dev/replay', './dev/benchmark'
+   import 'json'
+
+   prefix       = arg('pool')
+   command_key  = prefix .. 'command'
+   snapshot_key = prefix .. 'snapshot'
+   stop_key     = prefix .. 'stop'
+   ack_key      = prefix .. 'ack'
+   last_command:str
+   generation = 0
+   sequence   = 0
+   paused     = true
+   world:table
+   bodies     = array<table> { }
+   impacts    = array<table> { }
+   peaks      = array<double> { 0, 0 }
+   impact_id  = 0
+   last_time  = mSys.PreciseTime()
+   backlog    = 0
+   simulation_time   = 0
+   measuring         = false
+   step_times        = array<double> { }
+   publish_times     = array<double> { }
+   max_lag           = 0
+   simulated_seconds = 0
+   publish_interval  = 1000000 / 60
+   next_publish      = 0
+
+function publish(Immediate:bool!)
+   started = mSys.PreciseTime()
+   if Immediate then
+      next_publish = started + publish_interval
+   else
+      -- Keep a wall-clock cadence, skipping missed deadlines instead of publishing a catch-up burst.
+      next_publish += (math.floor((started - next_publish) / publish_interval) + 1) * publish_interval
+   end
+   sequence++
+   states = array<table> { }
+   for _, body in bodies do
+      states.push({
+         x=body.x, y=body.y, q=body.q, vx=body.vx, vy=body.vy, wx=body.wx, wy=body.wy, wz=body.wz,
+         groundTime=body.groundTime, stopped=body.stopped, roll=body.roll
+      })
+   end
+   async.pool[snapshot_key] = json.encode({
+      generation=generation, sequence=sequence, states=states, impacts=impacts,
+      time=started, simulationTime=simulation_time, lag=backlog, paused=paused
+   })
+   if measuring then publish_times.push((mSys.PreciseTime() - started) / 1000) end
+end
+
+   defer
+      async.pool[prefix .. 'metrics'] = json.encode({
+         stepMS=dice_benchmark.statistics(step_times), publishMS=dice_benchmark.statistics(publish_times),
+         maxLagMS=max_lag * 1000, simulatedSeconds=simulated_seconds
+      })
+   end
+
+   while not async.pool[stop_key] do
+      local encoded:str = async.pool[command_key]
+      if encoded and encoded != last_command then
+         local command = json.decode(encoded)
+         last_command = encoded
+         generation = command.generation
+         paused = command.paused
+         if command.throw then
+            local replay = dice_replay.decode(command.throw)
+            world = replay.world
+            bodies.clear()
+            for _, die in replay.dice do bodies.push(die.state) end
+            world.onImpact = function(Surface:bool!, Speed:num!)
+               local index = Surface ? 1 : 0
+               peaks[index] = math.max(peaks[index], Speed)
+            end
+            simulation_time = 0
+         end
+         if command.measure then measuring = true end
+         impacts.clear()
+         peaks.fill(0)
+         backlog = 0
+         last_time = mSys.PreciseTime()
+         publish(true)
+      end
+
+      local now = mSys.PreciseTime()
+      local active = false
+      if not paused then
+         for _, body in bodies do
+            if not body.stopped then active = true; break end
+         end
+      end
+      if not active then
+         backlog = 0
+         last_time = now
+         local err = mSys.WaitTime(0.01)
+         if err is ERR_Cancelled or err is ERR_Terminate then break end
+         check err
+         continue
+      end
+
+      backlog += math.max(0, (now - last_time) / 1000000)
+      last_time = now
+      if backlog < world.step then
+         local err = mSys.WaitTime(world.step - backlog)
+         if err is ERR_Cancelled or err is ERR_Terminate then break end
+         check err
+         continue
+      end
+
+      -- Preserve elapsed simulation time, but check commands and stop requests between individual fixed steps.
+      local started = mSys.PreciseTime()
+      dice_physics.advance(bodies, world, world.step)
+      backlog = math.max(0, backlog - world.step)
+      simulation_time += world.step
+      if measuring then
+         step_times.push((mSys.PreciseTime() - started) / 1000)
+         simulated_seconds += world.step
+         max_lag = math.max(max_lag, backlog)
+      end
+
+      local ack:num = async.pool[ack_key] ?? 0
+      now = mSys.PreciseTime()
+      while #impacts > 0 and (impacts[0].id <= ack or now - impacts[0].time > 250000) do impacts.remove(0) end
+      for i, speed in peaks do
+         if speed > 0 then
+            impact_id++
+            impacts.push({ id=impact_id, surface=i is 1, speed=speed, time=now })
+         end
+      end
+      peaks.fill(0)
+      local moving = false
+      for _, body in bodies do
+         if not body.stopped then moving = true; break end
+      end
+      -- Publish the final resting state even if its step falls before the next drawing deadline.
+      if not moving or mSys.PreciseTime() >= next_publish then publish(not moving) end
+   end

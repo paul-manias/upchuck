@@ -1,0 +1,876 @@
+-- Convex dice with unit mass and centres constrained to the desktop XY plane.  Rotation remains three-dimensional.
+-- The depth constraint has inverse mass diag(1, 1, 0); contact effective masses include it in every direction.
+
+   import './shapes'
+   namespace dice_physics { }
+
+function quatNormalise(Q:table!):table
+   length = math.sqrt((Q.w * Q.w) + (Q.x * Q.x) + (Q.y * Q.y) + (Q.z * Q.z))
+   return { w=Q.w / length, x=Q.x / length, y=Q.y / length, z=Q.z / length }
+end
+
+function quatMultiply(A:table!, B:table!):table
+   return {
+      w=(A.w * B.w) - (A.x * B.x) - (A.y * B.y) - (A.z * B.z),
+      x=(A.w * B.x) + (A.x * B.w) + (A.y * B.z) - (A.z * B.y),
+      y=(A.w * B.y) - (A.x * B.z) + (A.y * B.w) + (A.z * B.x),
+      z=(A.w * B.z) + (A.x * B.y) - (A.y * B.x) + (A.z * B.w)
+   }
+end
+
+function axisAngle(X:num!, Y:num!, Z:num!, Angle:num!):table
+   length = math.sqrt((X * X) + (Y * Y) + (Z * Z))
+   sine = math.sin(Angle * 0.5) / length
+   return quatNormalise({ w=math.cos(Angle * 0.5), x=X * sine, y=Y * sine, z=Z * sine })
+end
+
+function rotatePoint(Q:table!, Point:table!):table
+   -- Expanded q * p * conjugate(q), avoiding temporary quaternion allocations.
+
+   tx = 2 * ((Q.y * Point.z) - (Q.z * Point.y))
+   ty = 2 * ((Q.z * Point.x) - (Q.x * Point.z))
+   tz = 2 * ((Q.x * Point.y) - (Q.y * Point.x))
+   return {
+      x=Point.x + (Q.w * tx) + (Q.y * tz) - (Q.z * ty),
+      y=Point.y + (Q.w * ty) + (Q.z * tx) - (Q.x * tz),
+      z=Point.z + (Q.w * tz) + (Q.x * ty) - (Q.y * tx)
+   }
+end
+
+function dot3(A:table!, B:table!):num
+   return (A.x * B.x) + (A.y * B.y) + (A.z * B.z)
+end
+
+function cross3(A:table!, B:table!):table
+   return {
+      x=(A.y * B.z) - (A.z * B.y),
+      y=(A.z * B.x) - (A.x * B.z),
+      z=(A.x * B.y) - (A.y * B.x)
+   }
+end
+
+function add(A:table!, B:table!):table
+   return { x=A.x + B.x, y=A.y + B.y, z=A.z + B.z }
+end
+
+function sub(A:table!, B:table!):table
+   return { x=A.x - B.x, y=A.y - B.y, z=A.z - B.z }
+end
+
+function mul(A:table!, S:num!):table
+   return { x=A.x * S, y=A.y * S, z=A.z * S }
+end
+
+function unit(A:table!):table
+   return mul(A, 1 / math.sqrt(dot3(A, A)))
+end
+
+function centre(Body:table!):table
+   return { x=Body.x, y=Body.y, z=0 }
+end
+
+-- Convex SAT and clipped contact polygons for mixed polyhedral dice.  The original cube solver remains the
+-- fast path for D6 pairs.  Unique edge directions avoid testing parallel copies of the same separating axis.
+
+function convexGeometry(Body:table!, Radius:num!):table
+   shape = Body.shape ?? dice_shapes.get(6)
+   vertices, normals, edges = array<table> { }, array<table> { }, array<table> { }
+   for _, vertex in shape.vertices do
+      point = rotatePoint(Body.q, vertex)
+      point.x = Body.x + point.x * Radius
+      point.y = Body.y + point.y * Radius
+      point.z *= Radius
+      vertices.push(point)
+   end
+   for _, face in shape.faces do normals.push(rotatePoint(Body.q, face.normal)) end
+   for _, direction in shape.directions do edges.push(rotatePoint(Body.q, direction)) end
+   return { vertices=vertices, normals=normals, edges=edges, shape=shape }
+end
+
+function projection(Vertices:array<table>!, X:num!, Y:num!, Z:num!):<num, num>
+   lower, upper = math.huge, -math.huge
+   for _, vertex in Vertices do
+      d = vertex.x * X + vertex.y * Y + vertex.z * Z
+      lower, upper = math.min(lower, d), math.max(upper, d)
+   end
+   return lower, upper
+end
+
+function convexOverlap(GA:table!, GB:table!, World:table!):table
+   best:table = nil
+   distance = math.huge
+   function testAxis(X:num!, Y:num!, Z:num!, Kind:num!, I:num!, J:num!):bool
+      length = math.sqrt(X * X + Y * Y + Z * Z)
+      if length < 0.000001 then return true end
+      amin, amax = projection(GA.vertices, X, Y, Z)
+      bmin, bmax = projection(GB.vertices, X, Y, Z)
+      positive, negative = bmax - amin, amax - bmin
+      if positive < -World.skin * length or negative < -World.skin * length then return false end
+      -- A face axis must push away from that actual face.  Using its opposite direction is invalid for D4,
+      -- which has no parallel opposite face from which to build the contact polygon.
+      depth = Kind is 0 ? negative : (Kind is 1 ? positive : math.min(positive, negative))
+      reverse = Kind is 0 or (Kind is 2 and negative < positive)
+      xy = math.sqrt(X * X + Y * Y)
+      if xy < 0.0001 * length then return true end
+      if depth / xy < distance then
+         distance = depth / xy
+         sign = (reverse ? -1 : 1) / length
+         best = { n={ x=X * sign, y=Y * sign, z=Z * sign }, depth=depth / length,
+            kind=Kind, i=I, j=J, convex=true }
+      end
+      return true
+   end
+   -- Test faces first: separated pairs usually exit before the more expensive edge axes.
+   for i, n in GA.normals do
+      if not testAxis(n.x, n.y, n.z, 0, i, 0) then return nil end
+   end
+   for i, n in GB.normals do
+      if not testAxis(n.x, n.y, n.z, 1, i, 0) then return nil end
+   end
+   for i, a in GA.edges do
+      for j, b in GB.edges do
+         if not testAxis(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x,
+            2, i, j) then return nil end
+      end
+   end
+   return best
+end
+
+function geometry(Body:table!, Radius:num!):table
+   if Body.shape and Body.shape.sides != 6 then
+      g = convexGeometry(Body, Radius)
+      g.axes = g.normals
+      return g
+   end
+   axes = array<table> {
+      rotatePoint(Body.q, { x=1, y=0, z=0 }),
+      rotatePoint(Body.q, { x=0, y=1, z=0 }),
+      rotatePoint(Body.q, { x=0, y=0, z=1 })
+   }
+   vertices = array<table> { }
+   for x in {-1 into 1 by 2} do
+      for y in {-1 into 1 by 2} do
+         for z in {-1 into 1 by 2} do
+            vertices.push({
+               x=Body.x + Radius * (axes[0].x * x + axes[1].x * y + axes[2].x * z),
+               y=Body.y + Radius * (axes[0].y * x + axes[1].y * y + axes[2].y * z),
+               z=Radius * (axes[0].z * x + axes[1].z * y + axes[2].z * z)
+            })
+         end
+      end
+   end
+   return { axes=axes, vertices=vertices }
+end
+
+function extent(Axes:array<table>!, X:num!, Y:num!, Z:num!, Radius:num!):num
+   return Radius * (math.abs(Axes[0].x * X + Axes[0].y * Y + Axes[0].z * Z) +
+      math.abs(Axes[1].x * X + Axes[1].y * Y + Axes[1].z * Z) +
+      math.abs(Axes[2].x * X + Axes[2].y * Y + Axes[2].z * Z))
+end
+
+-- SAT over the six face normals and nine edge cross products.  Separation must be achievable in XY, so choose
+-- the least required in-plane displacement.  Pure depth axes still reject separated cubes.
+
+function overlap(A:table!, B:table!, GA:table!, GB:table!, World:table!):table
+   dx, dy = A.x - B.x, A.y - B.y
+   sphere_pair = (A.shape?.sides ?? 6) >= 12 and (B.shape?.sides ?? 6) >= 12
+
+   -- A regular die's face-plane distance is its inradius.  Prefer slight overlap to gaps between visible dice.
+
+   diameter = sphere_pair ? (A.shape.faces[0].distance + B.shape.faces[0].distance) * World.radius :
+      2 * math.sqrt(3) * World.radius
+   bound = diameter + World.skin
+
+   if dx * dx + dy * dy > bound * bound then return nil end
+
+      if sphere_pair then
+      -- The normal points from B towards A.
+      distance = math.sqrt(dx * dx + dy * dy)
+      normal = distance > 0.000000001 ?
+         { x=dx / distance, y=dy / distance, z=0 } : { x=1, y=0, z=0 }
+      return { n=normal, depth=diameter - distance, sphere=true }
+   end
+
+   if (A.shape and A.shape.sides != 6) or (B.shape and B.shape.sides != 6) then
+      return convexOverlap(GA.shape ? GA : convexGeometry(A, World.radius),
+         GB.shape ? GB : convexGeometry(B, World.radius), World)
+   end
+
+   distance = math.huge
+   best_x, best_y, best_z, best_depth = 0, 0, 0, 0
+   best_kind, best_i, best_j = 0, 0, 0
+   -- Preserve the original axis order for tied depths, but allocate only the final hit and normal.
+   for i in {0 to 3} do
+      for axis in {0 to 5} do
+         local x, y, z, kind, j = 0, 0, 0, 0, 0
+
+         if axis < 2 then
+            local n = axis is 0 ? GA.axes[i] : GB.axes[i]
+            x, y, z, kind = n.x, n.y, n.z, axis
+         else
+            kind, j = 2, axis - 2
+            local a, b = GA.axes[i], GB.axes[j]
+            x, y, z = a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x
+         end
+
+         local length = math.sqrt(x * x + y * y + z * z)
+         if length < 0.000001 then continue end
+
+         local inverse = 1 / length
+         x, y, z = x * inverse, y * inverse, z * inverse
+         local d = dx * x + dy * y
+         local depth = extent(GA.axes, x, y, z, World.radius) +
+            extent(GB.axes, x, y, z, World.radius) - math.abs(d)
+
+         if depth < -World.skin then return nil end
+
+         local xy = math.sqrt(x * x + y * y)
+         if xy < 0.0001 then continue end
+
+         -- Near a face contact, roundoff and tiny tilts can make an edge axis marginally shallower.
+         -- Prefer the face manifold within the contact skin instead of collapsing support to one point.
+         local candidate = depth / xy + (kind is 2 ? World.skin : 0)
+         if candidate < distance then
+            distance = candidate
+            local sign = d < 0 ? -1 : 1
+            best_x, best_y, best_z, best_depth = x * sign, y * sign, z * sign, depth
+            best_kind, best_i, best_j = kind, i, j
+         end
+      end
+   end
+   if distance is math.huge then return nil end
+   return { n={ x=best_x, y=best_y, z=best_z }, depth=best_depth, kind=best_kind, i=best_i, j=best_j }
+end
+
+function clip(Polygon:array<table>!, N:table!, Limit:num!):array<table>
+   result = array<table> { }
+   if #Polygon is 0 then return result end
+   previous = Polygon[#Polygon - 1]
+   previous_d = dot3(previous, N) - Limit
+
+   for _, point in Polygon do
+      d = dot3(point, N) - Limit
+      if (d <= 0) != (previous_d <= 0) then
+         fraction = previous_d / (previous_d - d)
+         result.push({
+            x = previous.x + (point.x - previous.x) * fraction,
+            y = previous.y + (point.y - previous.y) * fraction,
+            z = previous.z + (point.z - previous.z) * fraction
+         })
+      end
+
+      if d <= 0 then result.push(point) end
+      previous, previous_d = point, d
+   end
+   return result
+end
+
+function faceVertices(Body:table!, G:table!, N:table!, Radius:num!):array<table>
+   axis = 0
+   for i in {1 to 3} do
+      if math.abs(dot3(G.axes[i], N)) > math.abs(dot3(G.axes[axis], N)) then axis = i end
+   end
+
+   c = add(centre(Body), mul(G.axes[axis], dot3(G.axes[axis], N) < 0 ? -Radius : Radius))
+   u, v = mul(G.axes[(axis + 1) % 3], Radius), mul(G.axes[(axis + 2) % 3], Radius)
+   return array<table> { add(add(c, u), v), add(sub(c, u), v), sub(sub(c, u), v), add(sub(c, v), u) }
+end
+
+function supportEdge(Body:table!, G:table!, Axis:num!, N:table!, Radius:num!):<table, table>
+   c = centre(Body)
+   for i in {0 to 3} do
+      if i != Axis then c = add(c, mul(G.axes[i], dot3(G.axes[i], N) < 0 ? -Radius : Radius)) end
+   end
+   return sub(c, mul(G.axes[Axis], Radius)), add(c, mul(G.axes[Axis], Radius))
+end
+
+function edgeMidpoint(P:table!, Q:table!, R:table!, S:table!):table
+   u, v, w = sub(Q, P), sub(S, R), sub(P, R)
+   a, b, c, d, e = dot3(u, u), dot3(u, v), dot3(v, v), dot3(u, w), dot3(v, w)
+   denominator = (a * c) - (b * b)
+   t = denominator > 0.000001 ? math.clamp(((b * e) - (c * d)) / denominator, 0, 1) : 0
+   s = (b * t + e) / c
+   if s < 0 then
+      s, t = 0, math.clamp(-d / a, 0, 1)
+   elseif s > 1 then
+      s, t = 1, math.clamp((b - d) / a, 0, 1)
+   end
+   return mul(add(add(P, mul(u, t)), add(R, mul(v, s))), 0.5)
+end
+
+function convexFace(G:table!, N:table!):num
+   index, alignment = 0, -math.huge
+   for i, normal in G.normals do
+      d = dot3(normal, N)
+      if d > alignment then index, alignment = i, d end
+   end
+   return index
+end
+
+function convexEdge(G:table!, Axis:num!, N:table!):<table, table>
+   score = -math.huge
+   p, q = G.vertices[0], G.vertices[1]
+   for _, edge in G.shape.edges do
+      a, b = G.vertices[edge.a], G.vertices[edge.b]
+      if math.abs(dot3(unit(sub(b, a)), G.edges[Axis])) < 0.999999 then continue end
+      d = dot3(add(a, b), N)
+      if d > score then score, p, q = d, a, b end
+   end
+   return p, q
+end
+
+function convexManifold(GA:table!, GB:table!, Hit:table!, World:table!):array<table>
+   if Hit.kind is 2 then
+      p, q = convexEdge(GA, Hit.i, mul(Hit.n, -1))
+      r, s = convexEdge(GB, Hit.j, Hit.n)
+      return array<table> { edgeMidpoint(p, q, r, s) }
+   end
+
+   gr, gi, normal = GA, GB, mul(Hit.n, -1)
+   if Hit.kind is 1 then gr, gi, normal = GB, GA, Hit.n end
+   reference = gr.shape.faces[convexFace(gr, normal)]
+   incident = gi.shape.faces[convexFace(gi, mul(normal, -1))]
+   polygon = array<table> { }
+
+   for _, index in incident.indices do polygon.push(gi.vertices[index]) end
+
+   for j, index in reference.indices do
+      a = gr.vertices[index]
+      b = gr.vertices[reference.indices[(j + 1) % #reference.indices]]
+      side = unit(cross3(sub(b, a), normal))
+      polygon = clip(polygon, side, dot3(side, a))
+   end
+
+   plane = dot3(gr.vertices[reference.indices[0]], normal)
+   points = array<table> { }
+   for _, point in polygon do
+      separation = dot3(point, normal) - plane
+      if separation <= World.skin then points.push(sub(point, mul(normal, separation * 0.5))) end
+   end
+
+   return points
+end
+
+function manifold(A:table!, B:table!, GA:table!, GB:table!, Hit:table!, World:table!):array<table>
+   if Hit.sphere then
+      -- Average the opposing sphere surfaces using each shape's inscribed radius.
+      offset = (B.shape.faces[0].distance - A.shape.faces[0].distance) * World.radius * 0.5
+      return array<table> { {
+         x=(A.x + B.x) * 0.5 + Hit.n.x * offset, y=(A.y + B.y) * 0.5 + Hit.n.y * offset, z=0
+      } }
+   end
+
+   if Hit.convex then
+      return convexManifold(GA.shape ? GA : convexGeometry(A, World.radius),
+         GB.shape ? GB : convexGeometry(B, World.radius), Hit, World)
+   end
+
+   if Hit.kind is 2 then
+      p, q = supportEdge(A, GA, Hit.i, mul(Hit.n, -1), World.radius)
+      r, s = supportEdge(B, GB, Hit.j, Hit.n, World.radius)
+      return array<table> { edgeMidpoint(p, q, r, s) }
+   end
+
+   reference, incident, gr, gi = A, B, GA, GB
+   normal = mul(Hit.n, -1)
+   if Hit.kind is 1 then
+      reference, incident, gr, gi, normal = B, A, GB, GA, Hit.n
+   end
+
+   polygon = faceVertices(incident, gi, mul(normal, -1), World.radius)
+   c = centre(reference)
+   for i in {0 to 3} do
+      if i is Hit.i then continue end
+      axis = gr.axes[i]
+      polygon = clip(polygon, axis, dot3(c, axis) + World.radius)
+      polygon = clip(polygon, mul(axis, -1), -dot3(c, axis) + World.radius)
+   end
+
+   plane = dot3(c, normal) + World.radius
+   points = array<table> { }
+   for _, point in polygon do
+      separation = dot3(point, normal) - plane
+      if separation <= World.skin then
+         points.push(sub(point, mul(normal, separation * 0.5)))
+      end
+   end
+
+   return points
+end
+
+function velocity(Body:table, R:table!):<num, num, num>
+   if not Body then return 0, 0, 0 end
+
+   return Body.vx + Body.wy * R.z - Body.wz * R.y,
+      Body.vy + Body.wz * R.x - Body.wx * R.z,
+      Body.wx * R.y - Body.wy * R.x
+end
+
+function impulse(Body:table, R:table!, X:num!, Y:num!, Z:num!, Inertia:num!)
+   if not Body then return end
+   Body.vx += X
+   Body.vy += Y
+   Body.wx += (R.y * Z - R.z * Y) / Inertia
+   Body.wy += (R.z * X - R.x * Z) / Inertia
+   Body.wz += (R.x * Y - R.y * X) / Inertia
+end
+
+function massTerm(R:table!, U:table!, V:table!, Inertia:num!):num
+   ux, uy, uz = R.y * U.z - R.z * U.y, R.z * U.x - R.x * U.z, R.x * U.y - R.y * U.x
+   vx, vy, vz = R.y * V.z - R.z * V.y, R.z * V.x - R.x * V.z, R.x * V.y - R.y * V.x
+   return U.x * V.x + U.y * V.y + (ux * vx + uy * vy + uz * vz) / Inertia
+end
+
+function bodyInertia(Body:table, World:table!):num
+   if Body?.shape and Body.shape.sides != 6 then return Body.shape.inertia * World.radius * World.radius end
+   return World.inertia
+end
+
+function contactMass(C:table!, U:table!, V:table!, World:table!):num
+   k = massTerm(C.ra, U, V, bodyInertia(C.a, World))
+   if C.b then k += massTerm(C.rb, U, V, bodyInertia(C.b, World)) end
+   return k
+end
+
+function relativeVelocity(C:table!):<num, num, num>
+   ax, ay, az = velocity(C.a, C.ra)
+   bx, by, bz = velocity(C.b, C.rb)
+   return ax - bx, ay - by, az - bz
+end
+
+function applyContact(C:table!, X:num!, Y:num!, Z:num!, World:table!)
+   impulse(C.a, C.ra, X, Y, Z, bodyInertia(C.a, World))
+   impulse(C.b, C.rb, -X, -Y, -Z, bodyInertia(C.b, World))
+end
+
+function wake(Body:table!)
+   Body.stopped = false
+   Body.groundTime = 0
+   Body.balanceTime = 0
+end
+
+function contact(Contacts:array<table>!, A:table!, B:table, Point:table!, Normal:table!, Bounce:num!, World:table!)
+   tangent = math.abs(Normal.z) < 0.7 ? cross3(Normal, { x=0, y=0, z=1 }) :
+      cross3(Normal, { x=1, y=0, z=0 })
+
+   c = {
+      a=A, b=B, ra={ x=Point.x - A.x, y=Point.y - A.y, z=Point.z },
+      rb=B ? { x=Point.x - B.x, y=Point.y - B.y, z=Point.z } : Point,
+      n=Normal, t=unit(tangent), jn=0, jt=0, ju=0
+   }
+
+   c.u = cross3(Normal, c.t)
+   vx, vy, vz = relativeVelocity(c)
+   vn = vx * Normal.x + vy * Normal.y + vz * Normal.z
+   c.impactSpeed = math.max(0, -vn)
+   c.target = vn < -70 ? -Bounce * vn : 0
+   c.kn     = contactMass(c, c.n, c.n, World)
+   c.kt     = contactMass(c, c.t, c.t, World)
+   c.ku     = contactMass(c, c.u, c.u, World)
+   c.ktu    = contactMass(c, c.t, c.u, World)
+   Contacts.push(c)
+end
+
+function contacts(Bodies:array<table>!, World:table!):<array<table>, array<table>>
+   local result, shapes, pairs = array<table> { }, array<table> { }, array<table> { }
+   for body in values(Bodies) do
+      shapes.push(geometry(body, World.radius))
+      body.supported = false
+      body.faceSupported = false
+      body.braced = false
+   end
+
+   for i in {0 to #Bodies} do
+      for j in {i + 1 to #Bodies} do
+         a, b = Bodies[i], Bodies[j]
+         hit = overlap(a, b, shapes[i], shapes[j], World)
+         if not hit then continue end
+         points = manifold(a, b, shapes[i], shapes[j], hit, World)
+         if #points > 0 then pairs.push({ a=a, b=b, hit=hit, points=points }) end
+      end
+   end
+
+   -- Propagate wake-up through the whole touching group before creating constraints, including floor support for
+   -- newly woken bodies.  Otherwise an impact can push a sleeping support through the floor for one step.
+
+   for pass in {0 to #Bodies} do
+      changed = false
+      for _, pair in pairs do
+         if pair.a.stopped != pair.b.stopped then
+            wake(pair.a.stopped ? pair.a : pair.b)
+            changed = true
+         end
+      end
+
+      if not changed then break end
+   end
+
+   for i, body in Bodies do
+      if body.stopped then continue end
+      floor_points = 0
+      for _, point in shapes[i].vertices do
+         if point.y >= World.bottom - World.skin then floor_points++ end
+      end
+
+      body.faceSupported = floor_points >= 3
+      for _, point in shapes[i].vertices do
+         if point.y >= World.bottom - World.skin then
+            contact(result, body, nil, point, { x=0, y=-1, z=0 }, 0.34, World)
+            -- With fixed centre depth, edge/corner friction in Z can act as a hidden brace: its torque cancels
+            -- gravity's tipping torque without the centre being able to slide.  Limit that opposing torque until
+            -- a face is supported.  This is a desktop-plane approximation, not unrestricted 3D contact dynamics.
+            result[#result - 1].edgeFloor = not body.faceSupported
+            body.supported = true
+         end
+
+         if point.x <= World.left + World.skin then
+            contact(result, body, nil, point, { x=1, y=0, z=0 }, 0.55, World)
+            body.braced = true
+         end
+
+         if point.x >= World.right - World.skin then
+            contact(result, body, nil, point, { x=-1, y=0, z=0 }, 0.55, World)
+            body.braced = true
+         end
+      end
+   end
+
+   for pair in values(pairs) do
+      a, b, hit = pair.a, pair.b, pair.hit
+      if a.stopped and b.stopped then continue end
+
+      a.braced, b.braced = true, true
+      for _, point in pair.points do
+         contact(result, a, b, point, hit.n, 0.25, World)
+      end
+
+      if hit.n.y < -0.2 then a.supported = true end
+      if hit.n.y > 0.2 then b.supported = true end
+   end
+
+   return result, shapes
+end
+
+function solve(Contacts:array<table>!, World:table!)
+   -- Stacked face manifolds need more passes to transmit support through all contacts.  The convergence
+   -- check below still ends simple collisions early rather than always spending the full iteration budget.
+   for iteration in {0 to 96} do
+      largest_change = 0
+      for c in values(Contacts) do
+         vx, vy, vz = relativeVelocity(c)
+         vn = vx * c.n.x + vy * c.n.y + vz * c.n.z
+         jn = math.max(0, c.jn + (c.target - vn) / c.kn)
+         delta = jn - c.jn
+         applyContact(c, c.n.x * delta, c.n.y * delta, c.n.z * delta, World)
+         c.jn = jn
+
+         -- Solve both tangents together and project the accumulated impulse onto the Coulomb friction disk.
+
+         vx, vy, vz = relativeVelocity(c)
+         vt = vx * c.t.x + vy * c.t.y + vz * c.t.z
+         vu = vx * c.u.x + vy * c.u.y + vz * c.u.z
+         det = c.kt * c.ku - c.ktu * c.ktu
+         jt, ju = c.jt, c.ju
+
+         if det > 0.0000001 then
+            jt -= (c.ku * vt - c.ktu * vu) / det
+            ju -= (c.kt * vu - c.ktu * vt) / det
+         else
+            if c.kt > 0.0000001 then jt -= vt / c.kt end
+            if c.ku > 0.0000001 then ju -= vu / c.ku end
+         end
+
+         if c.edgeFloor and not c.a.braced then
+            -- On the floor t points along -X and u along -Z.  Leave at least half of the normal impulse's tipping
+            -- moment about X; retain frictional damping and re-solve X for the limited Z impulse.
+            tipping_limit = 0.5 * math.abs(c.ra.z) * jn / math.max(c.ra.y, World.skin)
+            ju = math.clamp(ju, -tipping_limit, tipping_limit)
+            jt = c.jt - (vt + c.ktu * (ju - c.ju)) / c.kt
+         end
+
+         local length = math.sqrt(jt * jt + ju * ju)
+         local limit = 0.55 * jn
+         if length > limit then jt, ju = jt * limit / length, ju * limit / length end
+
+         local dt, du = jt - c.jt, ju - c.ju
+
+         applyContact(c, c.t.x * dt + c.u.x * du, c.t.y * dt + c.u.y * du, c.t.z * dt + c.u.z * du, World)
+
+         c.jt, c.ju = jt, ju
+         largest_change = math.max(largest_change, math.abs(delta), math.sqrt(dt * dt + du * du))
+      end
+
+      if iteration >= 3 and largest_change < World.sleepSpeed * 0.0001 then break end
+   end
+end
+
+-- Split positional correction: remove overlap without manufacturing linear or angular velocity.
+-- This also separates the gathered group before release, while preserving its momentum.
+
+function separate(Bodies:array<table>!, World:table!, Iterations:num!, Shapes:array<table>)
+   if Iterations <= 0 then return end
+
+   -- Contact generation already rotated these vertices.  Correction changes positions, never orientations.
+
+   local shapes = Shapes ?? array<table> { }
+   if not Shapes then
+      for _, body in Bodies do shapes.push(geometry(body, World.radius)) end
+   end
+
+   for iteration in {0 to Iterations} do
+      local changed = false
+      for i, body in Bodies do
+         local g = shapes[i]
+         local min_x, max_x, max_y = math.huge, -math.huge, -math.huge
+         for _, point in g.vertices do
+            min_x, max_x, max_y = math.min(min_x, point.x), math.max(max_x, point.x), math.max(max_y, point.y)
+         end
+
+         local dx, dy = 0, 0
+         if min_x < World.left then dx = World.left - min_x end
+         if max_x > World.right then dx = World.right - max_x end
+         if max_y > World.bottom then dy = World.bottom - max_y end
+
+         if dx != 0 or dy != 0 then
+            changed = true
+            body.x += dx
+            body.y += dy
+            for _, point in g.vertices do
+               point.x += dx
+               point.y += dy
+            end
+         end
+      end
+
+      for i in {0 to #Bodies} do
+         for j in {i + 1 to #Bodies} do
+            local a, b = Bodies[i], Bodies[j]
+            local hit = overlap(a, b, shapes[i], shapes[j], World)
+            if not hit or hit.depth <= World.skin * 0.25 then continue end
+            changed = true
+
+            -- A displaced sleeper must resume simulation, or it can be left unsupported without gravity.
+
+            if a.stopped then wake(a) end
+            if b.stopped then wake(b) end
+            local xy2 = hit.n.x * hit.n.x + hit.n.y * hit.n.y
+            local correction = (hit.depth - World.skin * 0.25) * 0.5 / xy2
+            a.x += hit.n.x * correction
+            a.y += hit.n.y * correction
+            b.x -= hit.n.x * correction
+            b.y -= hit.n.y * correction
+
+            for _, point in shapes[i].vertices do
+               point.x += hit.n.x * correction
+               point.y += hit.n.y * correction
+            end
+
+            for _, point in shapes[j].vertices do
+               point.x -= hit.n.x * correction
+               point.y -= hit.n.y * correction
+            end
+         end
+      end
+
+      if not changed then break end
+   end
+end
+
+-- Edge/corner contacts can stall even when their support is offset from the centre, because the constrained-depth
+-- solver can resist tipping.  After an isolated balance remains quiet, gently tip it until contacts take over.
+
+function disturbBalance(Body:table!, World:table!, DT:num!, Quiet:bool!)
+   if not Quiet or not Body.supported or Body.faceSupported or Body.braced then
+      Body.balanceTime = 0
+      return
+   end
+
+   Body.balanceTime = (Body.balanceTime ?? 0) + DT
+   if Body.balanceTime < 0.3 then return end
+
+   -- Keep correcting a stalled balance instead of waiting another 0.3 seconds between tiny nudges.
+   -- Scaling by simulation time keeps recovery smooth and independent of timer cadence and adaptive substeps.
+
+   local g = geometry(Body, World.radius)
+   local bottom = -math.huge
+   for _, point in g.vertices do bottom = math.max(bottom, point.y) end
+   local down = g.axes[0]
+
+   if g.shape then
+      for _, normal in g.normals do
+         if normal.y > down.y then down = normal end
+      end
+   else
+      for i in {1 to 3} do
+         if math.abs(g.axes[i].y) > math.abs(down.y) then down = g.axes[i] end
+      end
+      if down.y < 0 then down = mul(down, -1) end
+   end
+
+   local axis = cross3(down, { x=0, y=1, z=0 })
+
+   if dot3(axis, axis) < 0.000001 then return end
+
+   local angle = math.min(12 * math.pi / 180 * DT, math.acos(math.clamp(down.y, -1, 1)))
+   Body.q = quatNormalise(quatMultiply(axisAngle(axis.x, axis.y, axis.z, angle), Body.q))
+
+   -- Keep the lowest vertex on the same plane.  Tipping towards the nearest down face lowers the centre of mass;
+   -- this adjustment creates neither penetration nor a free upward displacement, and adds no velocity impulse.
+
+   local new_bottom = -math.huge
+   for _, point in geometry(Body, World.radius).vertices do new_bottom = math.max(new_bottom, point.y) end
+   Body.y += bottom - new_bottom
+end
+
+function substep(Bodies:array<table>!, World:table!, DT:num!)
+   for _, body in Bodies do
+      if body.stopped then continue end
+
+      body.vy += World.gravity * DT
+
+      local air = math.exp(-0.12 * DT)
+      body.vx *= air
+      body.vy *= air
+      body.wx *= air
+      body.wy *= air
+      body.wz *= air
+   end
+
+   -- Resolve support and friction before moving: advancing positions under gravity first lets separation
+   -- slide loaded dice sideways without any opposing friction impulse.
+
+   local manifold_contacts = contacts(Bodies, World)
+   solve(manifold_contacts, World)
+   if World.onImpact then
+      for _, c in manifold_contacts do
+         if c.jn > 0 and c.impactSpeed >= 40 then World.onImpact(c.b is nil, c.impactSpeed) end
+      end
+   end
+
+   for _, body in Bodies do
+      if body.stopped then continue end
+      body.x += body.vx * DT
+      body.y += body.vy * DT
+
+      local speed = math.sqrt(body.wx * body.wx + body.wy * body.wy + body.wz * body.wz)
+      if speed > 0.000001 then
+         body.q = quatNormalise(quatMultiply(axisAngle(body.wx, body.wy, body.wz, speed * DT), body.q))
+      end
+   end
+
+   -- Positions and orientations changed after contact generation; rebuild correction geometry.
+
+   separate(Bodies, World, 3)
+
+   -- Sleep each connected group together.  A distant moving die must not keep quiet dice awake.
+   local groups = array<int> { }
+   for i, body in Bodies do
+      groups.push(i)
+      body.physicsIndex = i
+   end
+
+   for _, c in manifold_contacts do
+      if not c.b then continue end
+      local a, b = groups[c.a.physicsIndex], groups[c.b.physicsIndex]
+      if a != b then
+         for i in {0 to #groups} do
+            if groups[i] is b then groups[i] = a end
+         end
+      end
+   end
+
+   local quiet = array<int, #Bodies>
+   quiet.fill(1)
+
+   for i, body in Bodies do
+      if body.stopped then continue end
+      local speed2 = body.vx * body.vx + body.vy * body.vy
+      local spin2 = body.wx * body.wx + body.wy * body.wy + body.wz * body.wz
+      local low_motion = speed2 < World.sleepSpeed * World.sleepSpeed and spin2 < 0.0025
+      disturbBalance(body, World, DT, low_motion)
+      local stable_support = body.supported and (body.faceSupported or body.braced)
+      if stable_support and low_motion then
+         body.groundTime += DT
+      else
+         body.groundTime = 0
+      end
+      if body.groundTime < 0.5 then quiet[groups[i]] = 0 end
+   end
+
+   for i, body in Bodies do
+      if quiet[groups[i]] is 1 then
+         body.stopped = true
+         body.vx, body.vy, body.wx, body.wy, body.wz = 0, 0, 0, 0, 0
+      end
+   end
+end
+
+dice_physics.newWorld = function(Radius:num!, Left:num!, Right:num!, Bottom:num!):table
+   return {
+      radius=Radius, inertia=(1 / 3) * Radius * Radius, left=Left, right=Right, bottom=Bottom,
+      gravity=2000, skin=Radius * 0.005, sleepSpeed=Radius / 36, accumulator=0, step=1 / 120
+   }
+end
+
+dice_physics.advance = function(Bodies:array<table>!, World:table!, Elapsed:num!)
+   local active = false
+   for _, body in Bodies do
+      if not body.stopped then active = true end
+   end
+
+   if not active then
+      World.accumulator = 0
+      return
+   end
+
+   World.accumulator += math.max(0, Elapsed)
+   while World.accumulator + 0.000000001 >= World.step do
+      -- Small dice and fast throws need additional steps to avoid crossing each other between collision checks.
+      local remaining = World.step
+      while remaining > 0.000000001 do
+         local max_speed = 1
+         for _, body in Bodies do
+            local spin = math.sqrt(body.wx * body.wx + body.wy * body.wy + body.wz * body.wz)
+            local speed = math.sqrt(body.vx * body.vx + body.vy * body.vy) + spin * World.radius * math.sqrt(3)
+            max_speed = math.max(max_speed, speed)
+         end
+         local dt = math.min(remaining, World.radius * 0.15 / max_speed)
+         substep(Bodies, World, dt)
+         remaining -= dt
+      end
+
+      World.accumulator -= World.step
+      local moving = false
+      for _, body in Bodies do
+         if not body.stopped then moving = true end
+      end
+
+      if not moving then
+         World.accumulator = 0
+         break
+      end
+   end
+end
+
+dice_physics.releaseVelocity = function(Samples:array<table>!, Now:num!):<num, num>
+   if #Samples < 2 or Now - Samples[#Samples - 1].time > 0.08 then return 0, 0 end
+   local first = #Samples - 1
+   while first > 0 and Now - Samples[first - 1].time <= 0.1 do first -= 1 end
+   local sample = Samples[first]
+   local last = Samples[#Samples - 1]
+   -- Measure over the sampled interval.  A brief pause before release must not dilute the throw; longer pauses are
+   -- already rejected above.
+   local dt = last.time - sample.time
+   if dt <= 0 or first is #Samples - 1 then return 0, 0 end
+   return math.clamp((last.x - sample.x) / dt, -1250, 1250),
+      math.clamp((last.y - sample.y) / dt, -1250, 1250)
+end
+
+dice_physics.separate = separate
+dice_physics.geometry = geometry
+dice_physics.overlap = overlap
+dice_physics.contacts = contacts
+dice_physics.solve = solve
+dice_physics.rotatePoint = rotatePoint
+dice_physics.axisAngle = axisAngle
+dice_physics.quatMultiply = quatMultiply
